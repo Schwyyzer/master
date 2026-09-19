@@ -154,7 +154,7 @@ function build_hessian(
         end
     end
 
-    H = sparse(rows, cols, vals, rank, rank)
+    H = sparse(rows[1:ptr-1], cols[1:ptr-1], vals[1:ptr-1], rank, rank)
 
     return H
 end
@@ -321,34 +321,46 @@ function build_hessian_fast(
 
         offdiag = -1.0/sqrt(mi*mj)
 
-        sr2  = (sig*sig)/r2
-        sr6  = sr2^3
-        sr12 = sr6^2
+        # `neighbors` is a Verlet/skin list padded beyond rc (see
+        # build_neighbor_pairs), so it also contains pairs with
+        # rc < r <= rc+0.5 that must NOT contribute to the Hessian.
+        # Zeroing their components (rather than `continue`) keeps every
+        # pair's fixed 18-slot block in rows/cols/vals written, since
+        # this loop runs multi-threaded with a per-pair pointer and a
+        # skipped write would leave that block as uninitialized memory.
+        if r <= rc && r > 0
 
-        dV =
-            -4.0*eps*(
-                12.0*sr12/r -
-                6.0*sr6/r
-            )
+            sr2  = (sig*sig)/r2
+            sr6  = sr2^3
+            sr12 = sr6^2
 
-        ddV =
-            4.0*eps*(
-                12.0*13.0*sr12/r2 -
-                6.0*7.0*sr6/r2
-            )
+            dV =
+                -4.0*eps*(
+                    12.0*sr12/r -
+                    6.0*sr6/r
+                )
 
-        fn0 = dV/r
-        fn1 = ddV - fn0
+            ddV =
+                4.0*eps*(
+                    12.0*13.0*sr12/r2 -
+                    6.0*7.0*sr6/r2
+                )
 
-        invr2 = 1.0/r2
+            fn0 = dV/r
+            fn1 = ddV - fn0
 
-        xx = fn1*dx*dx*invr2 + fn0
-        yy = fn1*dy*dy*invr2 + fn0
-        zz = fn1*dz*dz*invr2 + fn0
+            invr2 = 1.0/r2
 
-        xy = fn1*dx*dy*invr2
-        xz = fn1*dx*dz*invr2
-        yz = fn1*dy*dz*invr2
+            xx = fn1*dx*dx*invr2 + fn0
+            yy = fn1*dy*dy*invr2 + fn0
+            zz = fn1*dz*dz*invr2 + fn0
+
+            xy = fn1*dx*dy*invr2
+            xz = fn1*dx*dz*invr2
+            yz = fn1*dy*dz*invr2
+        else
+            xx = yy = zz = xy = xz = yz = 0.0
+        end
 
         comps = (
             (1,1,xx),
@@ -477,34 +489,42 @@ function build_hessian_claude(
         diag_j  = 1.0/mj
         offdiag = -1.0/sqrt(mi*mj)
 
-        sr2  = (sig*sig)/r2
-        sr6  = sr2^3
-        sr12 = sr6^2
+        # see build_hessian_fast: `neighbors` is a padded skin list, so
+        # zero out (rather than skip) any pair beyond the real cutoff to
+        # avoid leaving this pair's fixed-position slots uninitialized.
+        if r <= rc && r > 0
 
-        dV =
-            -4.0*eps*(
-                12.0*sr12/r -
-                6.0*sr6/r
-            )
+            sr2  = (sig*sig)/r2
+            sr6  = sr2^3
+            sr12 = sr6^2
 
-        ddV =
-            4.0*eps*(
-                12.0*13.0*sr12/r2 -
-                6.0*7.0*sr6/r2
-            )
+            dV =
+                -4.0*eps*(
+                    12.0*sr12/r -
+                    6.0*sr6/r
+                )
 
-        fn0 = dV/r
-        fn1 = ddV - fn0
+            ddV =
+                4.0*eps*(
+                    12.0*13.0*sr12/r2 -
+                    6.0*7.0*sr6/r2
+                )
 
-        invr2 = 1.0/r2
+            fn0 = dV/r
+            fn1 = ddV - fn0
 
-        xx = fn1*dx*dx*invr2 + fn0
-        yy = fn1*dy*dy*invr2 + fn0
-        zz = fn1*dz*dz*invr2 + fn0
+            invr2 = 1.0/r2
 
-        xy = fn1*dx*dy*invr2
-        xz = fn1*dx*dz*invr2
-        yz = fn1*dy*dz*invr2
+            xx = fn1*dx*dx*invr2 + fn0
+            yy = fn1*dy*dy*invr2 + fn0
+            zz = fn1*dz*dz*invr2 + fn0
+
+            xy = fn1*dx*dy*invr2
+            xz = fn1*dx*dz*invr2
+            yz = fn1*dy*dz*invr2
+        else
+            xx = yy = zz = xy = xz = yz = 0.0
+        end
 
         comps = (
             (1,1,xx),

@@ -8,7 +8,7 @@ function relax(positions, data, neighbors, moves, box;
                max_steps=max_relaxation_steps)
 
     Iter = 0
-    tol = 1e-3
+    tol = 1e-5
     positions .= mod.(positions, collect(box)')
     neighbors = build_neighbor_pairs(positions, rc, box)
 
