@@ -169,7 +169,12 @@ function lowest_modes(
     tol = 1e-5,
     maxiter = 500
 )
-    BLAS.set_num_threads(16)
+    # BLAS thread count is a global, process-wide setting -- it does not
+    # belong inside a hot function that may be called many times per
+    # second, and hardcoding 16 here is actively wrong once you run
+    # several independent attempts in parallel (each process would try
+    # to grab 16 BLAS threads, wildly oversubscribing the machine).
+    # Set it once at program startup instead (see run_parallel.jl).
     n = size(H,1)
 
     # --------------------------------------------------
