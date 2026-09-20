@@ -90,78 +90,118 @@ println("workers = $(workers())  (each pinned to 1 thread; BLAS pinned to 1 thre
 
 # ============================================================
 # Dispatch loop: keep every worker busy until TARGET_SUCCESSES
+#
+# Everything from here on is wrapped in a function rather than left as
+# top-level script code. This isn't just style: a `while` loop at
+# top-level script scope has "soft scope" in Julia, so `n_attempts +=
+# 1` inside it (when `n_attempts` was already defined outside the
+# loop) is genuinely ambiguous and, when run non-interactively via
+# `julia run_parallel.jl` (as opposed to the REPL), resolves to
+# creating a brand new local -- which then fails with UndefVarError
+# the moment it's read before being assigned. A function has ordinary,
+# unambiguous lexical scoping throughout, which sidesteps this
+# entirely (and lets Julia type-infer everything properly, which is
+# also just faster than top-level global-variable code).
 # ============================================================
-seed_state = Ref(1)
-next_seed() = (s = seed_state[]; seed_state[] += 1; s)
+function run_batch()
+    seed_state = Ref(1)
+    next_seed() = (s = seed_state[]; seed_state[] += 1; s)
 
-function dispatch!(w)
-    s = next_seed()
-    dump_path = joinpath(DUMP_DIR, "saddle_$(lpad(s, 6, '0')).dump")
-    return remotecall(attempt_wrapper, w, s, dump_path)
-end
-
-pending = Dict{Int,Future}()   # worker_id => Future
-for w in workers()
-    pending[w] = dispatch!(w)
-end
-
-successes = AttemptResult[]
-n_attempts = 0
-start_time = time()
-
-log_io = open(LOG_PATH, "w")
-println(log_io, "seed,success,kicked_atom,phase1_iters,total_iters,crit_eigenvalue,initial_energy,final_energy,dump_file,error")
-flush(log_io)
-
-while length(successes) < TARGET_SUCCESSES
-    for w in collect(keys(pending))
-        fut = pending[w]
-        if isready(fut)
-            res = fetch(fut)
-            n_attempts += 1
-
-            err_field = res.error === nothing ? "" : replace(res.error, "\n" => " | ", "," => ";")
-            dump_field = res.dump_file === nothing ? "" : res.dump_file
-            println(log_io,
-                "$(res.seed),$(res.success),$(res.kicked_atom),$(res.steps_part1),$(res.iteration)," *
-                "$(res.crit_eigenvalue),$(res.initial_energy),$(res.final_energy),$dump_field,$err_field"
-            )
-            flush(log_io)
-
-            if res.success
-                push!(successes, res)
-                elapsed = round(time() - start_time, digits=1)
-                @printf(
-                    "[%2d/%2d] SUCCESS  seed=%-6d atom=%-5d E=%.6f  iters=%-4d (phase1=%-4d)  elapsed=%.1fs  attempts_so_far=%d\n",
-                    length(successes), TARGET_SUCCESSES, res.seed, res.kicked_atom,
-                    res.final_energy, res.iteration, res.steps_part1, elapsed, n_attempts
-                )
-            elseif n_attempts % 20 == 0
-                elapsed = round(time() - start_time, digits=1)
-                println("  ...$n_attempts attempts tried so far, $(length(successes)) successes, elapsed=$(elapsed)s")
-            end
-
-            if length(successes) >= TARGET_SUCCESSES
-                break
-            end
-
-            pending[w] = dispatch!(w)
-        end
+    function dispatch!(w)
+        s = next_seed()
+        dump_path = joinpath(DUMP_DIR, "saddle_$(lpad(s, 6, '0')).dump")
+        return remotecall(attempt_wrapper, w, s, dump_path)
     end
-    sleep(0.05)
+
+    pending = Dict{Int,Future}()   # worker_id => Future
+    for w in workers()
+        pending[w] = dispatch!(w)
+    end
+
+    successes = AttemptResult[]
+    n_attempts = 0
+    start_time = time()
+
+    log_io = open(LOG_PATH, "w")
+    println(log_io, "seed,success,kicked_atom,phase1_iters,total_iters,crit_eigenvalue,initial_energy,final_energy,dump_file,error")
+    flush(log_io)
+
+    live_workers = Set(workers())
+
+    while length(successes) < TARGET_SUCCESSES && !isempty(live_workers)
+        for w in collect(keys(pending))
+            fut = pending[w]
+            if isready(fut)
+                # run_art_attempt already catches every ordinary
+                # algorithm-level failure and returns a failed
+                # AttemptResult instead of throwing. This extra layer
+                # only guards against the worker PROCESS itself dying
+                # (e.g. OOM) -- rare, but this run is meant to survive
+                # unattended, so one dead worker shouldn't take the
+                # whole batch down with it.
+                local res
+                try
+                    res = fetch(fut)
+                catch e
+                    println("worker $w appears to have died ($(sprint(showerror, e))); dropping it, continuing with the rest")
+                    delete!(pending, w)
+                    delete!(live_workers, w)
+                    continue
+                end
+                n_attempts += 1
+
+                err_field = res.error === nothing ? "" : replace(res.error, "\n" => " | ", "," => ";")
+                dump_field = res.dump_file === nothing ? "" : res.dump_file
+                println(log_io,
+                    "$(res.seed),$(res.success),$(res.kicked_atom),$(res.steps_part1),$(res.iteration)," *
+                    "$(res.crit_eigenvalue),$(res.initial_energy),$(res.final_energy),$dump_field,$err_field"
+                )
+                flush(log_io)
+
+                if res.success
+                    push!(successes, res)
+                    elapsed = round(time() - start_time, digits=1)
+                    @printf(
+                        "[%2d/%2d] SUCCESS  seed=%-6d atom=%-5d E=%.6f  iters=%-4d (phase1=%-4d)  elapsed=%.1fs  attempts_so_far=%d\n",
+                        length(successes), TARGET_SUCCESSES, res.seed, res.kicked_atom,
+                        res.final_energy, res.iteration, res.steps_part1, elapsed, n_attempts
+                    )
+                elseif n_attempts % 20 == 0
+                    elapsed = round(time() - start_time, digits=1)
+                    println("  ...$n_attempts attempts tried so far, $(length(successes)) successes, elapsed=$(elapsed)s")
+                end
+
+                if length(successes) >= TARGET_SUCCESSES
+                    break
+                end
+
+                pending[w] = dispatch!(w)
+            end
+        end
+        sleep(0.05)
+    end
+
+    close(log_io)
+    rmprocs(workers())
+
+    return successes, n_attempts
 end
 
-close(log_io)
-rmprocs(workers())
+successes, n_attempts = run_batch()
 
 # ============================================================
 # Diversity summary
 # ============================================================
-n = length(successes)
-println("\n=== Done: $n saddle points found after $n_attempts attempts ===")
-println("full per-attempt log: $LOG_PATH")
+function print_diversity_summary(successes, n_attempts)
+    n = length(successes)
+    println("\n=== Done: $n saddle points found after $n_attempts attempts ===")
+    println("full per-attempt log: $LOG_PATH")
 
-if n >= 2
+    if n < 2
+        println("fewer than 2 successes -- not enough to compare diversity.")
+        return
+    end
+
     box_vec = [data["lx"] data["ly"] data["lz"]]
 
     # Displacement of each success's final structure relative to the shared
@@ -198,6 +238,6 @@ if n >= 2
     rmsd_path = joinpath(OUTPUT_DIR, "pairwise_rmsd.csv")
     writedlm(rmsd_path, rmsd, ',')
     println("full pairwise RMSD matrix: $rmsd_path")
-else
-    println("fewer than 2 successes -- not enough to compare diversity.")
 end
+
+print_diversity_summary(successes, n_attempts)
