@@ -100,8 +100,26 @@ end
 """
     track_mode(H, v_old)
 
-Single-mode convenience wrapper around track_modes, as a drop-in
-replacement for the old (buggy) track_mode(H, v_old).
+Single-mode (k=1) convenience wrapper around track_modes.
+
+IMPORTANT, found by testing: this does NOT reliably survive an
+eigenvalue crossing/near-degeneracy, even with the Symmetric wrap and
+preconditioner fixed. With only one output vector there is nothing to
+overlap-match against -- LOBPCG's "smallest eigenvalue" objective will
+converge to the true global minimum given enough iterations regardless
+of the warm start, so once some other mode becomes more unstable than
+the one you're tracking, this returns THAT mode instead, silently.
+(Confirmed with a synthetic avoided-crossing test: k=1 tracking jumps
+to the wrong branch right after the crossing, exactly like the
+original bug; a block of k>=5-8, tracked via track_modes directly and
+matched by overlap, stays correct through the entire crossing.)
+
+Kept only for call sites that truly have just one vector to hand in.
+For actual mode-following in the ART loop (phase 1/2, calculate_moves),
+call track_modes with a block of several eigenvectors (a similar block
+size to whatever calculate_moves currently requests via full
+diagonalization) and track the specific column that corresponds to
+your mode of interest -- do not rely on this single-vector form there.
 """
 function track_mode(H, v_old)
     v_old = v_old ./ norm(v_old)

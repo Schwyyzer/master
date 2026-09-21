@@ -16,11 +16,22 @@ in seconds. Three tests:
      from a fresh dense diagonalization of H2, matched by overlap).
   3. Synthetic avoided crossing: a hand-built matrix where two
      eigenvalues swap order as a parameter t sweeps 0->1. Compares
-     "naive: always take the algebraically lowest eigenvalue" (what a
-     cold full re-diagonalization + blind lowest-mode selection does)
-     against track_modes' overlap-based tracking, through the
-     crossing. This is the exact mechanism behind the phase-2
-     mode-jump failures seen on the real system.
+     three things at each t: (a) naive full-diagonalization + "take
+     the lowest" selection, (b) single-vector (k=1) track_modes, and
+     (c) block (k=8) track_modes -- through the crossing.
+
+     IMPORTANT, found in the first round of testing: (a) and (b) BOTH
+     fail right after the crossing, and for the same underlying
+     reason -- with only one output vector there's nothing to
+     overlap-match against, so LOBPCG's "find the smallest
+     eigenvalue" objective just converges to the new true global
+     minimum once some other mode overtakes yours, regardless of the
+     warm start. Only (c), a block with more than one vector, gives
+     overlap-matching something to actually disambiguate. This is why
+     track_mode (singular) now carries an explicit warning in
+     mode_tracking.jl, and why any real use in the ART loop should go
+     through track_modes with a block of several vectors, not the
+     single-vector wrapper.
 
 Each test prints PASS/FAIL plus the numbers behind the verdict.
 =#
@@ -42,7 +53,7 @@ verdict(ok) = ok ? PASS : FAIL
 # ============================================================
 # Build a small synthetic LJ configuration (no external file needed)
 # ============================================================
-function make_synthetic_system(N::Int, box::NTuple{3,Float64}; seed::Int=1, min_dist::Float64=0.85)
+function make_synthetic_system(N::Int, box::NTuple{3,Float64}; seed::Int=1, min_dist::Float64=1.0)
     rng = MersenneTwister(seed)
     positions = zeros(N, 3)
     boxv = [box[1], box[2], box[3]]
@@ -75,11 +86,93 @@ function make_synthetic_system(N::Int, box::NTuple{3,Float64}; seed::Int=1, min_
     return positions, data
 end
 
+# Minimal standalone LJ force + steepest-descent relax, so this script
+# doesn't need to include Version1.1.jl (and its BenchmarkTools
+# dependency) just to knock down the worst overlaps from random
+# placement. Doesn't need to be precise -- just enough that the test
+# Hessian has genuine near-zero translational modes and modest-sized
+# nonzero eigenvalues, instead of the huge, pathological curvatures a
+# raw random packing produces.
+function mini_force(positions, cid, neighbors, box)
+    N = size(positions, 1)
+    F = zeros(N, 3)
+    for p in 1:size(neighbors, 1)
+        i, j = neighbors[p, 1], neighbors[p, 2]
+        dx = positions[i, 1] - positions[j, 1]
+        dy = positions[i, 2] - positions[j, 2]
+        dz = positions[i, 3] - positions[j, 3]
+        dx -= box[1] * round(dx / box[1])
+        dy -= box[2] * round(dy / box[2])
+        dz -= box[3] * round(dz / box[3])
+        r2 = dx^2 + dy^2 + dz^2
+        r = sqrt(r2)
+        if r <= rc && r > 0
+            ti, tj = cid[i], cid[j]
+            eps = epsilon_table[ti, tj]
+            sig = sigma_table[ti, tj]
+            sig6 = sig^6
+            sig12 = sig6^2
+            pref = 24 * eps * (2 * sig12 / r2^7 - sig6 / r2^4)
+            F[i, 1] += pref * dx; F[i, 2] += pref * dy; F[i, 3] += pref * dz
+            F[j, 1] -= pref * dx; F[j, 2] -= pref * dy; F[j, 3] -= pref * dz
+        end
+    end
+    return F
+end
+
+function mini_energy(positions, cid, neighbors, box)
+    e = 0.0
+    for p in 1:size(neighbors, 1)
+        i, j = neighbors[p, 1], neighbors[p, 2]
+        dx = positions[i, 1] - positions[j, 1]
+        dy = positions[i, 2] - positions[j, 2]
+        dz = positions[i, 3] - positions[j, 3]
+        dx -= box[1] * round(dx / box[1])
+        dy -= box[2] * round(dy / box[2])
+        dz -= box[3] * round(dz / box[3])
+        r2 = dx^2 + dy^2 + dz^2
+        r = sqrt(r2)
+        if r <= rc && r > 0
+            ti, tj = cid[i], cid[j]
+            eps = epsilon_table[ti, tj]
+            sig = sigma_table[ti, tj]
+            sig6 = sig^6
+            sig12 = sig6^2
+            e += 4 * eps * (sig12 / r^12 - sig6 / r^6)
+        end
+    end
+    return e
+end
+
+# Same adaptive accept/reject step-size scheme as the project's own
+# relax() (grow on success, shrink on failure) -- proven to converge
+# well within a modest step budget on the real system.
+function mini_relax!(positions, cid, box; steps::Int=300, step0::Float64=0.0005)
+    step = step0
+    for _ in 1:steps
+        pairs = build_neighbor_pairs(positions, rc, box)
+        F = mini_force(positions, cid, pairs, box)
+        maximum(norm.(eachrow(F))) < 1e-3 && break
+        trial = mod.(positions .+ step .* F, [box[1] box[2] box[3]])
+        if mini_energy(trial, cid, pairs, box) < mini_energy(positions, cid, pairs, box)
+            positions .= trial
+            step *= 1.05
+        else
+            step *= 0.5
+            step < 1e-10 && break
+        end
+    end
+    return positions
+end
+
 N = 60
 box = (6.0, 6.0, 6.0)   # denser than the real system, so the test is well-connected
                         # (and meaningful) whatever `rc` you currently have set in config.jl
 positions, data = make_synthetic_system(N, box; seed=1)
 boxtuple = (data["lx"], data["ly"], data["lz"])
+mini_relax!(positions, data["cid"], boxtuple)
+data["x"] = positions[:, 1]; data["y"] = positions[:, 2]; data["z"] = positions[:, 3]
+
 pairs = build_neighbor_pairs(positions, rc, boxtuple)
 H1 = build_hessian_fast(positions, data, pairs)
 @assert maximum(abs.(H1 - H1')) < 1e-8 "sanity check failed: Hessian isn't symmetric"
@@ -154,9 +247,9 @@ println("  ", verdict(ok2_new))
 # TEST 3: synthetic avoided crossing -- the actual mode-jump mechanism
 # ============================================================
 println("\n=== TEST 3: avoided crossing (the mode-jump failure mode, isolated) ===")
-println("Two eigenvalues cross as t: 0 -> 1 (index 5 goes -1 -> +1, index 6 goes +1 -> -1).")
-println("A cold full-diagonalization + \"take the lowest\" selection is expected to jump")
-println("branches right after the crossing; overlap-based track_modes should not.\n")
+println("Two eigenvalues cross as t: 0 -> 1 (index 6 goes -1 -> +1, index 7 goes +1 -> -1).")
+println("Comparing naive full-diag+lowest, single-vector (k=1) tracking, and block")
+println("(k=8) tracking through the crossing.\n")
 
 n_abs = 50
 rng3 = MersenneTwister(3)
@@ -177,38 +270,59 @@ function H_at(t::Float64)
     return Symmetric(Qt * Diagonal(vals) * Qt'), vals, Qt
 end
 
-H0, _, Q0 = H_at(0.0)
-v_prev = Q0[:, 6]
+H0, vals0, Q0 = H_at(0.0)
 
-all_ok = true
+# --- single-vector (k=1) tracking, warm-started at the target ---
+v_prev_single = Q0[:, 6]
+
+# --- block (k=8) tracking, warm-started from the 8 lowest eigenpairs of H0,
+#     with the tracked target identified by whichever slot best matches it
+#     (mirrors how this would actually be seeded: one full diagonalization,
+#     then track that whole block from then on) ---
+kblock = 8
+order0 = sortperm(vals0)
+X_prev_block = Q0[:, order0[1:kblock]]
+target_slot = argmax([abs(dot(X_prev_block[:, i], Q0[:, 6])) for i in 1:kblock])
+println("block tracking: following slot $target_slot of $kblock\n")
+
+single_ok = true
+block_ok = true
 for t in 0.0:0.1:1.0
     H, vals_true, Qt = H_at(t)
     true_target_vec = Qt[:, 6]   # by construction, the smooth continuation
+    Hsparse = sparse(Matrix(H))
 
     w, V = eigen(H)
     naive_idx = argmin(w)
-    naive_vec = V[:, naive_idx]
-    naive_matches_true = abs(dot(naive_vec, true_target_vec)) > 0.9
+    naive_matches_true = abs(dot(V[:, naive_idx], true_target_vec)) > 0.9
 
-    vals_tr, vecs_tr, overlaps_tr = track_modes(sparse(Matrix(H)), reshape(v_prev, :, 1); maxiter=200, tol=1e-10)
-    tracked_vec = vecs_tr[:, 1]
-    tracked_overlap_true = abs(dot(tracked_vec, true_target_vec))
+    vals_s, vecs_s, _ = track_modes(Hsparse, reshape(v_prev_single, :, 1); maxiter=200, tol=1e-10)
+    single_vec = vecs_s[:, 1]
+    single_overlap = abs(dot(single_vec, true_target_vec))
+
+    vals_b, vecs_b, _ = track_modes(Hsparse, X_prev_block; maxiter=200, tol=1e-10)
+    block_vec = vecs_b[:, target_slot]
+    block_overlap = abs(dot(block_vec, true_target_vec))
 
     println("t=$(round(t,digits=1))  true_eig=$(round(-1+2*t,digits=3))  " *
-            "naive(global-min)_eig=$(round(w[naive_idx],digits=3)) matches_true=$naive_matches_true  " *
-            "tracked_eig=$(round(vals_tr[1],digits=3)) overlap_with_true=$(round(tracked_overlap_true,digits=3))")
+            "naive_matches_true=$naive_matches_true  " *
+            "single(k=1)_overlap=$(round(single_overlap,digits=3))  " *
+            "block(k=$kblock)_overlap=$(round(block_overlap,digits=3))")
 
-    global all_ok
-    if tracked_overlap_true < 0.9
-        all_ok = false
-    end
-    global v_prev = tracked_vec
+    global single_ok, block_ok
+    single_overlap < 0.9 && (single_ok = false)
+    block_overlap < 0.9 && (block_ok = false)
+    global v_prev_single = single_vec
+    global X_prev_block = vecs_b
 end
 
-println("\ntrack_modes stayed on the correct branch through the entire crossing: ", verdict(all_ok))
+println("\nsingle-vector (k=1) tracking survived the whole crossing: ", verdict(single_ok),
+        "  (expected to FAIL -- this is why track_mode carries a warning)")
+println("block (k=$kblock) tracking survived the whole crossing:     ", verdict(block_ok))
 
 println("\n=== SUMMARY ===")
-println("Test 1 (static sanity check):        ", verdict(ok1))
-println("Test 2 (old track_mode after perturb): ", verdict(ok2_old), "   <- expect this to FAIL")
-println("Test 2 (new track_modes after perturb): ", verdict(ok2_new))
-println("Test 3 (avoided crossing, tracking):   ", verdict(all_ok))
+println("Test 1 (static sanity check):            ", verdict(ok1))
+println("Test 2 (old track_mode after perturb):    ", verdict(ok2_old))
+println("Test 2 (new track_modes after perturb):   ", verdict(ok2_new))
+println("Test 3 (single-vector through crossing):  ", verdict(single_ok), "   <- expect this to FAIL")
+println("Test 3 (block-k=$kblock through crossing):    ", verdict(block_ok))
