@@ -22,50 +22,154 @@ criteria, same formulas) -- with two differences, both making this
      the 3 closest to zero -- too thin a margin to reliably land on the
      right mode.
 
-One more thing worth being explicit about: both existing implementations
-share a SINGLE iteration budget across phase 1 and phase 2 combined
-(Python: iteration<2000; Version1.1.jl: iteration<1000), not independent
-per-phase budgets. This keeps that shared-budget structure (using
-Python's more generous 2000), just extends it to also bound phase 1,
-which previously had no cap in either language.
+Both existing implementations share a SINGLE iteration budget across
+phase 1 and phase 2 combined (Python: iteration<2000; Version1.1.jl:
+iteration<1000). This keeps that shared-budget structure (using
+Python's more generous 2000), extended to also bound phase 1, which
+previously had no cap in either language.
 
-One robustness addition on top, needed only because this now runs many
-attempts unattended in parallel (does not change the physics):
+PHASE 2 now uses warm-started block mode tracking (track_modes, from
+mode_tracking.jl) instead of a cold full re-diagonalization every
+iteration -- see calculate_moves_tracked below. This was validated
+against a synthetic avoided-crossing test before being wired in here:
+single-vector tracking provably cannot survive a crossing (nothing to
+overlap-match against), block tracking (k=10-15) does, staying correct
+through the whole crossing. This also fixes the reproducible phase-2
+mode-jump seen on the real 1728-atom system, and is much cheaper per
+call (LOBPCG needs only matrix-vector products; ARPACK shift-invert
+needs a sparse LU factorization every single call -- ~8s of the ~10s
+per call on that system was the factorization alone). A periodic full
+diagonalization (every `mode_recheck_every` iterations, default 25)
+re-anchors the tracked slot by overlap as a safety check against silent
+drift through a genuine near-degeneracy.
+
+Two robustness additions, needed only because this now runs many
+attempts unattended in parallel (neither changes the physics):
 
   - The whole attempt runs inside a try/catch, so a single relax()
     failure (its designed `ArgumentError` on step-size collapse) is
     recorded as a failed attempt instead of killing the worker process.
-    Phase 1 previously had no iteration cap at all in either language --
-    fine to babysit interactively, not fine unattended, since one kick
-    that never destabilizes would strand a worker forever. It now
-    shares the same max_total_iter budget as phase 2.
+  - A failed attempt (phase 1 never destabilized, or phase 2 didn't
+    converge) gets one unconstrained relax() from wherever it ended up,
+    compared against the starting minimum's energy. Phase 2 can push
+    the system past a real barrier without cleanly pinning down the
+    saddle (the dot-product/eigenvalue criteria never firing cleanly);
+    this catches those cases -- a genuinely different resulting minimum
+    is a real transition found, independent of whether the saddle
+    itself was formally converged.
 =#
 
 using LinearAlgebra
 using Random
 
-struct AttemptResult
+include("mode_tracking.jl")
+
+Base.@kwdef struct AttemptResult
     success::Bool
     seed::Int
     kicked_atom::Int
     kick_dir::Vector{Float64}
     initial_energy::Float64
-    final_energy::Float64
-    crit_eigenvalue::Float64
-    iteration::Int
-    steps_part1::Int
-    positions::Union{Matrix{Float64},Nothing}
-    dump_file::Union{String,Nothing}
-    error::Union{String,Nothing}
+    final_energy::Float64 = NaN
+    crit_eigenvalue::Float64 = NaN
+    iteration::Int = 0
+    steps_part1::Int = 0
+    positions::Union{Matrix{Float64},Nothing} = nothing
+    dump_file::Union{String,Nothing} = nothing
+    error::Union{String,Nothing} = nothing
+    # unconstrained-relax check on failed attempts (nothing for successes,
+    # and nothing if an exception prevented the check from running)
+    overshoot_energy::Union{Float64,Nothing} = nothing
+    overshoot_new_minimum::Union{Bool,Nothing} = nothing
+    overshoot_positions::Union{Matrix{Float64},Nothing} = nothing
+    # angle (degrees) between successive phase-2 moves -- large values are
+    # exactly the mode-jump symptom track_modes is meant to eliminate, so
+    # this is the direct empirical check that it worked
+    max_phase2_angle_deg::Union{Float64,Nothing} = nothing
 end
 
-function _failed_result(seed, kicked_atom, kick_dir, initial_energy, err::String)
-    AttemptResult(false, seed, kicked_atom, kick_dir, initial_energy, NaN, NaN, 0, 0, nothing, nothing, err)
+function _failed_result(
+    seed, kicked_atom, kick_dir, initial_energy, err::String;
+    iteration::Int = 0, steps_part1::Int = 0,
+    overshoot_energy = nothing, overshoot_new_minimum = nothing, overshoot_positions = nothing,
+)
+    AttemptResult(;
+        success=false, seed, kicked_atom, kick_dir, initial_energy,
+        iteration, steps_part1, error=err,
+        overshoot_energy, overshoot_new_minimum, overshoot_positions,
+    )
+end
+
+"""
+    _overshoot_check(positions, data, pairs, box, initial_energy)
+
+Run one full unconstrained relaxation from `positions` (e.g. wherever a
+failed attempt ended up) and compare its energy against
+`initial_energy`. Returns (energy, positions, new_minimum::Bool), where
+new_minimum is true if the relaxed energy differs from the start by
+more than a small tolerance -- a cheap first-pass signal; a proper
+check should also compare structure (see run_parallel.jl's pairwise
+RMSD analysis, which this feeds into for failed-but-overshot attempts).
+"""
+function _overshoot_check(positions, data, pairs, box, initial_energy; tol::Float64=1e-3)
+    ov_pairs = build_neighbor_pairs(positions, rc, box)
+    ov_positions = relax(copy(positions), data, ov_pairs, nothing, box)
+    ov_pairs_final = build_neighbor_pairs(ov_positions, rc, box)
+    ov_energy = compute_energy(ov_positions, data["cid"], box, epsilon_table, sigma_table, ov_pairs_final)
+    new_minimum = abs(ov_energy - initial_energy) > tol
+    return ov_energy, ov_positions, new_minimum
+end
+
+"""
+    calculate_moves_tracked(positions, data, neighbors, F, X_prev, target_slot,
+                             move_modifier=move_phase2_modifier; full_recheck=false)
+
+Phase-2 move calculation using warm-started block mode tracking
+(track_modes) instead of a cold full re-diagonalization every
+iteration. `X_prev` is the block of eigenvectors from the previous call
+(or from the phase1->phase2 handoff); `target_slot` is which column of
+that block is "our" mode. Returns `(moves, eigenvalue, X_new,
+target_slot)`, which feed directly into the next call.
+
+`full_recheck=true` runs a full diagonalization instead of LOBPCG
+tracking (same block size), and re-identifies target_slot by overlap
+with the previously-tracked eigenvector -- the periodic safety check
+against silent drift through a near-degeneracy.
+"""
+function calculate_moves_tracked(
+    positions, data, neighbors, F, X_prev::AbstractMatrix, target_slot::Int,
+    move_modifier=move_phase2_modifier;
+    full_recheck::Bool=false,
+)
+    H = build_hessian_fast(positions, data, neighbors)
+    k = size(X_prev, 2)
+    old_target_vec = X_prev[:, target_slot]
+
+    if full_recheck
+        vals_full, vecs_full = lowest_modes(H, k)
+        overlaps = [abs(dot(old_target_vec, vecs_full[:, i])) for i in 1:k]
+        target_slot = argmax(overlaps)
+        X_new = vecs_full
+        eigenvalue = vals_full[target_slot]
+    else
+        vals_tr, vecs_tr, _ = track_modes(H, X_prev)
+        X_new = vecs_tr
+        eigenvalue = vals_tr[target_slot]
+    end
+
+    moves = X_new[:, target_slot] .* move_modifier
+    moves = reshape(moves, 3, :)'
+
+    if dot(moves, F) > 0
+        moves = -moves
+    end
+
+    return moves, eigenvalue, X_new, target_slot
 end
 
 """
     run_art_attempt(seed, positions0, data, pairs0, box; dump_file=nothing,
-                    max_total_iter=2000)
+                    max_total_iter=2000, mode_recheck_every=25)
 
 Run one full ART attempt (random kick -> phase 1 activation -> phase 2
 eigenvector-following) starting from the given relaxed minimum
@@ -87,6 +191,7 @@ function run_art_attempt(
     box;
     dump_file::Union{String,Nothing} = nothing,
     max_total_iter::Int = 2000,
+    mode_recheck_every::Int = 25,
 )
     rng = MersenneTwister(seed)
     natoms = data["natoms"]
@@ -146,18 +251,31 @@ function run_art_attempt(
             # never destabilized (or ran out of the shared iteration budget):
             # not a saddle search failure in the "something is wrong" sense,
             # just an unproductive kick.
-            return _failed_result(seed, kicked_atom, kick_dir, initial_energy,
-                                   "phase 1 did not reach eigenvalue_cutoff within max_total_iter")
+            ov_energy, ov_positions, ov_new_min = _overshoot_check(positions, data, pairs, box, initial_energy)
+            return _failed_result(
+                seed, kicked_atom, kick_dir, initial_energy,
+                "phase 1 did not reach eigenvalue_cutoff within max_total_iter";
+                iteration, steps_part1=iteration,
+                overshoot_energy=ov_energy, overshoot_new_minimum=ov_new_min, overshoot_positions=ov_positions,
+            )
         end
 
         steps_part1 = iteration
 
-        # ---------------- phase 2: eigenvector-following to the saddle ----------------
-        moves = relevant_eigenvector .* move_phase2_modifier
-        moves = reshape(moves, 3, :)'
+        # ---- phase1 -> phase2 handoff: seed the tracked block ----
+        # One fresh k=15 diagonalization here (matching the original
+        # calculate_moves' block size) reusing the Hessian already built
+        # at the end of phase 1 -- a one-time cost, not per-iteration --
+        # gives phase 2 tracking a wider safety margin than phase 1's k=10.
+        vals15, vecs15 = lowest_modes(H, 15)
+        target_slot = argmax([abs(dot(relevant_eigenvector, vecs15[:, i])) for i in 1:15])
+        X_block = vecs15
+        crit_eigenvalue = vals15[target_slot]
 
-        crit_eigenvalue = relevant_eigenvalue
-        val = vals
+        # ---------------- phase 2: eigenvector-following to the saddle ----------------
+        moves = X_block[:, target_slot] .* move_phase2_modifier
+        moves = reshape(moves, 3, :)'
+        max_phase2_angle_deg = 0.0
 
         while crit_eigenvalue < 0 &&
               iteration < max_total_iter &&
@@ -168,8 +286,12 @@ function run_art_attempt(
             end
 
             old_moves = copy(moves)
-            moves, val = calculate_moves(positions, data, pairs, F, old_moves, move_phase2_modifier)
-            crit_eigenvalue = val[lowest_nonzero_mode(val)]
+            moves, crit_eigenvalue, X_block, target_slot = calculate_moves_tracked(
+                positions, data, pairs, F, X_block, target_slot, move_phase2_modifier;
+                full_recheck = (iteration % mode_recheck_every == 0),
+            )
+            angle_deg = rad2deg(angle_between(vec(old_moves'), vec(moves')))
+            max_phase2_angle_deg = max(max_phase2_angle_deg, angle_deg)
 
             positions .+= moves
             positions = relax(positions, data, pairs, moves, box)
@@ -191,12 +313,19 @@ function run_art_attempt(
             )
         end
 
-        return AttemptResult(
+        overshoot_energy = overshoot_new_minimum = overshoot_positions = nothing
+        if !success
+            overshoot_energy, overshoot_positions, overshoot_new_minimum =
+                _overshoot_check(positions, data, pairs, box, initial_energy)
+        end
+
+        return AttemptResult(;
             success, seed, kicked_atom, kick_dir, initial_energy, final_energy,
             crit_eigenvalue, iteration, steps_part1,
-            success ? positions : nothing,
-            success ? dump_file : nothing,
-            nothing,
+            positions = success ? positions : nothing,
+            dump_file = success ? dump_file : nothing,
+            overshoot_energy, overshoot_new_minimum, overshoot_positions,
+            max_phase2_angle_deg,
         )
 
     catch e

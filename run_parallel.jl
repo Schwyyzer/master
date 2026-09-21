@@ -1,7 +1,17 @@
 #=
 Run many independent ART attempts in parallel (as separate OS processes,
 via Julia's Distributed stdlib) until a target number of saddle points
-have been found, then report a first-pass diversity summary.
+have been found, then report: a diversity summary, any failed attempts
+that overshot into a different minimum on unconstrained relax, and the
+barrier energy of every saddle point found.
+
+Phase 2 (art_core.jl) now uses warm-started block mode tracking
+instead of a cold full re-diagonalization every iteration -- fixes the
+reproducible mode-jump seen on the real system and should be
+noticeably faster (no sparse LU factorization per call). The per-
+success log line now also reports max_phase2_angle_deg: large values
+(previously common right where phase 2 used to fail) are the direct
+empirical signal to watch for if something's still off.
 
 WHY SEPARATE PROCESSES AND NOT Threads.@threads:
 Phase 1/2 both diagonalize the Hessian through Arpack.jl, which wraps the
@@ -40,6 +50,8 @@ MAX_TOTAL_ITER = 2000                     # shared phase1+phase2 budget, matches
                                            # new_start_1_1_1.py's `iteration<2000`
                                            # (Version1.1.jl used 1000; phase 1 had
                                            # no cap at all in either language)
+MODE_RECHECK_EVERY = 25                   # phase-2 tracked-mode full-diagonalization
+                                           # safety check cadence (see art_core.jl)
 
 OUTPUT_DIR = "//home//schwyyzer//Desktop//Master Thesis//parallel_art_run_$(Dates.format(now(), "yyyymmdd_HHMMSS"))"
 DUMP_DIR = joinpath(OUTPUT_DIR, "dumps")
@@ -66,6 +78,7 @@ end
 
 @everywhere lammps_path = $LAMMPS_PATH
 @everywhere max_total_iter = $MAX_TOTAL_ITER
+@everywhere mode_recheck_every = $MODE_RECHECK_EVERY
 @everywhere begin
     data = parse_lammps_data(lammps_path)
     positions0 = hcat(data["x"], data["y"], data["z"])
@@ -81,6 +94,7 @@ end
             seed, positions0, data, pairs0, box;
             dump_file = dump_path,
             max_total_iter = max_total_iter,
+            mode_recheck_every = mode_recheck_every,
         )
     end
 end
@@ -119,11 +133,16 @@ function run_batch()
     end
 
     successes = AttemptResult[]
+    overshoot_finds = AttemptResult[]   # failed attempts whose unconstrained
+                                         # relax landed in a genuinely different minimum
     n_attempts = 0
     start_time = time()
 
     log_io = open(LOG_PATH, "w")
-    println(log_io, "seed,success,kicked_atom,phase1_iters,total_iters,crit_eigenvalue,initial_energy,final_energy,dump_file,error")
+    println(log_io,
+        "seed,success,kicked_atom,phase1_iters,total_iters,crit_eigenvalue,initial_energy," *
+        "final_energy,max_phase2_angle_deg,overshoot_energy,overshoot_new_minimum,dump_file,error"
+    )
     flush(log_io)
 
     live_workers = Set(workers())
@@ -152,9 +171,13 @@ function run_batch()
 
                 err_field = res.error === nothing ? "" : replace(res.error, "\n" => " | ", "," => ";")
                 dump_field = res.dump_file === nothing ? "" : res.dump_file
+                angle_field = res.max_phase2_angle_deg === nothing ? "" : round(res.max_phase2_angle_deg, digits=2)
+                ov_e_field = res.overshoot_energy === nothing ? "" : res.overshoot_energy
+                ov_new_field = res.overshoot_new_minimum === nothing ? "" : res.overshoot_new_minimum
                 println(log_io,
                     "$(res.seed),$(res.success),$(res.kicked_atom),$(res.steps_part1),$(res.iteration)," *
-                    "$(res.crit_eigenvalue),$(res.initial_energy),$(res.final_energy),$dump_field,$err_field"
+                    "$(res.crit_eigenvalue),$(res.initial_energy),$(res.final_energy),$angle_field," *
+                    "$ov_e_field,$ov_new_field,$dump_field,$err_field"
                 )
                 flush(log_io)
 
@@ -162,13 +185,23 @@ function run_batch()
                     push!(successes, res)
                     elapsed = round(time() - start_time, digits=1)
                     @printf(
-                        "[%2d/%2d] SUCCESS  seed=%-6d atom=%-5d E=%.6f  iters=%-4d (phase1=%-4d)  elapsed=%.1fs  attempts_so_far=%d\n",
+                        "[%2d/%2d] SUCCESS  seed=%-6d atom=%-5d E=%.6f  iters=%-4d (phase1=%-4d)  max_angle=%.1f°  elapsed=%.1fs  attempts_so_far=%d\n",
                         length(successes), TARGET_SUCCESSES, res.seed, res.kicked_atom,
-                        res.final_energy, res.iteration, res.steps_part1, elapsed, n_attempts
+                        res.final_energy, res.iteration, res.steps_part1,
+                        something(res.max_phase2_angle_deg, NaN), elapsed, n_attempts
                     )
-                elseif n_attempts % 20 == 0
-                    elapsed = round(time() - start_time, digits=1)
-                    println("  ...$n_attempts attempts tried so far, $(length(successes)) successes, elapsed=$(elapsed)s")
+                else
+                    if res.overshoot_new_minimum == true
+                        push!(overshoot_finds, res)
+                        @printf(
+                            "  [overshoot] seed=%-6d atom=%-5d landed in a different minimum on unconstrained relax (E=%.6f vs start %.6f)\n",
+                            res.seed, res.kicked_atom, res.overshoot_energy, res.initial_energy
+                        )
+                    end
+                    if n_attempts % 20 == 0
+                        elapsed = round(time() - start_time, digits=1)
+                        println("  ...$n_attempts attempts tried so far, $(length(successes)) successes, elapsed=$(elapsed)s")
+                    end
                 end
 
                 if length(successes) >= TARGET_SUCCESSES
@@ -184,10 +217,10 @@ function run_batch()
     close(log_io)
     rmprocs(workers())
 
-    return successes, n_attempts
+    return successes, overshoot_finds, n_attempts
 end
 
-successes, n_attempts = run_batch()
+successes, overshoot_finds, n_attempts = run_batch()
 
 # ============================================================
 # Diversity summary
@@ -240,4 +273,47 @@ function print_diversity_summary(successes, n_attempts)
     println("full pairwise RMSD matrix: $rmsd_path")
 end
 
+# ============================================================
+# Overshoot summary: failed attempts whose unconstrained relax landed
+# in a genuinely different minimum than the start (see art_core.jl's
+# _overshoot_check) -- real transitions found even where phase 2 never
+# cleanly converged on the saddle itself.
+# ============================================================
+function print_overshoot_summary(overshoot_finds)
+    n = length(overshoot_finds)
+    println("\n=== Failed attempts that overshot into a different minimum: $n ===")
+    n == 0 && return
+    for r in overshoot_finds
+        @printf("  seed=%-6d atom=%-5d E_overshoot=%.6f  ΔE=%.6f\n",
+                r.seed, r.kicked_atom, r.overshoot_energy, r.overshoot_energy - r.initial_energy)
+    end
+end
+
+# ============================================================
+# Barrier energies: the actual point of an ART search. For each
+# converged saddle, barrier = saddle_energy - starting_minimum_energy.
+# ============================================================
+function print_barrier_summary(successes)
+    n = length(successes)
+    println("\n=== Barrier energies of all saddle points found ($n) ===")
+    if n == 0
+        println("no successes -- nothing to report.")
+        return
+    end
+
+    barriers = [(s.seed, s.final_energy - s.initial_energy) for s in successes]
+    sort!(barriers, by = x -> x[2])
+
+    for (seed, barrier) in barriers
+        @printf("  seed=%-6d barrier = %.6f\n", seed, barrier)
+    end
+
+    vals = [b for (_, b) in barriers]
+    @printf("\nmin barrier  = %.6f\n", minimum(vals))
+    @printf("max barrier  = %.6f\n", maximum(vals))
+    @printf("mean barrier = %.6f\n", sum(vals) / n)
+end
+
 print_diversity_summary(successes, n_attempts)
+print_overshoot_summary(overshoot_finds)
+print_barrier_summary(successes)
