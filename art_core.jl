@@ -152,9 +152,28 @@ function calculate_moves_tracked(
         X_new = vecs_full
         eigenvalue = vals_full[target_slot]
     else
-        vals_tr, vecs_tr, _ = track_modes(H, X_prev)
-        X_new = vecs_tr
-        eigenvalue = vals_tr[target_slot]
+        vals_tr, vecs_tr, ok = try
+            v, x, o = track_modes(H, X_prev)
+            (all(isfinite, v) && all(isfinite, x)) ? (v, x, true) : (v, x, false)
+        catch
+            (Float64[], zeros(0, 0), false)
+        end
+
+        if ok
+            X_new = vecs_tr
+            eigenvalue = vals_tr[target_slot]
+        else
+            # LOBPCG tracking produced non-finite output (or threw) --
+            # fall back to a full diagonalization for this one iteration
+            # rather than propagating garbage (e.g. NaN moves, which
+            # relax() can never turn into a decreasing-energy step and
+            # which manifests as a spurious "step magnitude too small").
+            vals_full, vecs_full = lowest_modes(H, k)
+            overlaps = [abs(dot(old_target_vec, vecs_full[:, i])) for i in 1:k]
+            target_slot = argmax(overlaps)
+            X_new = vecs_full
+            eigenvalue = vals_full[target_slot]
+        end
     end
 
     moves = X_new[:, target_slot] .* move_modifier
@@ -204,6 +223,10 @@ function run_art_attempt(
         positions0, data["cid"], box, epsilon_table, sigma_table, pairs0
     )
 
+    iteration = 0
+    steps_part1 = 0
+    phase = "init"
+
     try
         positions = copy(positions0)
         pairs = copy(pairs0)
@@ -212,9 +235,11 @@ function run_art_attempt(
         first_move[kicked_atom, :] = kick_dir .* first_move_modifier
 
         positions .+= first_move
+        phase = "initial_relax"
         positions = relax(positions, data, pairs, first_move, box)
 
         # ---------------- phase 1: fixed-direction activation ----------------
+        phase = "phase1_setup"
         H = build_hessian_fast(positions, data, pairs)
         vals, vecs = lowest_modes(H, 10)
         idx = lowest_nonzero_mode(vals)
@@ -228,7 +253,7 @@ function run_art_attempt(
             moves = -moves
         end
 
-        iteration = 0
+        phase = "phase1"
         F = force(positions, data, pairs)
 
         while relevant_eigenvalue > eigenvalue_cutoff && iteration < max_total_iter
@@ -261,6 +286,7 @@ function run_art_attempt(
         end
 
         steps_part1 = iteration
+        phase = "phase1_to_phase2_handoff"
 
         # ---- phase1 -> phase2 handoff: seed the tracked block ----
         # One fresh k=15 diagonalization here (matching the original
@@ -276,6 +302,7 @@ function run_art_attempt(
         moves = X_block[:, target_slot] .* move_phase2_modifier
         moves = reshape(moves, 3, :)'
         max_phase2_angle_deg = 0.0
+        phase = "phase2"
 
         while crit_eigenvalue < 0 &&
               iteration < max_total_iter &&
@@ -329,6 +356,10 @@ function run_art_attempt(
         )
 
     catch e
-        return _failed_result(seed, kicked_atom, kick_dir, initial_energy, sprint(showerror, e))
+        return _failed_result(
+            seed, kicked_atom, kick_dir, initial_energy,
+            "[$(phase), iteration=$(iteration)] " * sprint(showerror, e);
+            iteration, steps_part1,
+        )
     end
 end

@@ -60,8 +60,25 @@ function track_modes(H, X_prev::AbstractMatrix; maxiter::Int=100, tol::Real=1e-8
 
     X0 = Matrix(qr(X_prev).Q[:, 1:k])
 
+    # Jacobi/diagonal preconditioner. LOBPCG requires P to be SYMMETRIC
+    # POSITIVE DEFINITE (its B-orthonormalization/Rayleigh-Ritz steps
+    # implicitly assume this). diag(H) is NOT guaranteed positive here --
+    # phase 2 is by construction the regime where H has a negative
+    # eigenvalue (that's the while-loop condition in run_art_attempt),
+    # and individual diagonal entries routinely go negative or near-zero
+    # right along with it. A bare `1 ./ d` preconditioner is only valid
+    # near a minimum; using it near a saddle silently breaks LOBPCG's
+    # internal assumptions (NaN/Inf or a domain error from an implicit
+    # sqrt of a negative number), which is consistent with the observed
+    # 100%, seed-independent failure on the real system (every attempt
+    # hits this in the same broken state) vs. the synthetic test, whose
+    # small hand-built system apparently never had a negative diagonal
+    # entry to expose this. Taking abs() keeps P a valid SPD *magnitude*
+    # preconditioner (still speeds up convergence, just no longer
+    # sign-fooled) without changing what track_modes actually solves for
+    # (that's still governed by Hs = Symmetric(H) itself).
     d = diag(H)
-    d[abs.(d) .< 1e-10] .= 1.0
+    d = max.(abs.(d), 1e-10)
     Pinv = Diagonal(1.0 ./ d)
 
     result = lobpcg(
