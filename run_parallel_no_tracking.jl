@@ -7,14 +7,22 @@ barrier energy of every saddle point found.
 
 This is the NO-MODE-TRACKING variant: phase 2 uses the original cold
 full re-diagonalization every iteration (art_core_no_tracking.jl /
-calculate_moves), i.e. the version that gave 10/10 successes on the
-real system, plus the overshoot-relax check and barrier-energy summary
-that were added alongside mode tracking but don't depend on it. Mode
-tracking is set aside for now (see art_core.jl / mode_tracking.jl /
-test_mode_tracking_precond.jl to revisit it later). The per-success log
-line still reports max_phase2_angle_deg -- worth watching here since
-cold re-diagonalization is exactly what originally produced the
-large-angle mode jumps.
+calculate_moves), i.e. the version that gave 10/10 then 50/50 successes
+on the real system, plus the overshoot-relax check and barrier-energy
+summary that were added alongside mode tracking but don't depend on it.
+Mode tracking is set aside for now (see art_core.jl / mode_tracking.jl /
+rqi_tracking.jl to revisit it later).
+
+Phase 2's step size is now ADAPTIVE: proportional to the force parallel
+to the move direction, large early in phase 2 (steep, just-destabilized
+landscape) and shrinking toward the old fixed move_phase2_modifier
+(now the floor) as that parallel force vanishes approaching the saddle
+-- capped at MAX_PHASE2_STEP below. See art_core_no_tracking.jl's
+run_art_attempt docstring for the exact calibration. First test: floor
+unchanged, ceiling set to 5x it -- watch phase2_step_size_min/max in
+the CSV to see the actual taper, and max_phase2_angle_deg in case
+bigger early steps reintroduce mode-jump problems the fixed small step
+didn't have.
 
 WHY SEPARATE PROCESSES AND NOT Threads.@threads:
 Phase 1/2 both diagonalize the Hessian through Arpack.jl, which wraps the
@@ -53,8 +61,15 @@ MAX_TOTAL_ITER = 2000                     # shared phase1+phase2 budget, matches
                                            # new_start_1_1_1.py's `iteration<2000`
                                            # (Version1.1.jl used 1000; phase 1 had
                                            # no cap at all in either language)
-MODE_RECHECK_EVERY = 25                   # phase-2 tracked-mode full-diagonalization
-                                           # safety check cadence (see art_core.jl)
+MODE_RECHECK_EVERY = 25                   # unused by this variant, kept for
+                                           # signature compatibility with art_core.jl
+MAX_PHASE2_STEP_MULTIPLIER = 5.0          # ceiling on the adaptive phase-2 step size,
+                                           # as a multiple of move_phase2_modifier (the
+                                           # floor, unchanged from before this change).
+                                           # First test per the user's request: 5x.
+                                           # (Actual MAX_PHASE2_STEP is computed below,
+                                           # once config.jl -- and so move_phase2_modifier
+                                           # -- has actually been loaded.)
 
 OUTPUT_DIR = "//home//schwyyzer//Desktop//Master Thesis//parallel_art_run_$(Dates.format(now(), "yyyymmdd_HHMMSS"))"
 DUMP_DIR = joinpath(OUTPUT_DIR, "dumps")
@@ -81,9 +96,14 @@ end
                                 # every worker independently oversubscribing BLAS
 end
 
+MAX_PHASE2_STEP = MAX_PHASE2_STEP_MULTIPLIER * move_phase2_modifier
+println("phase-2 adaptive step size: floor=$move_phase2_modifier  ceiling=$MAX_PHASE2_STEP " *
+        "($(MAX_PHASE2_STEP_MULTIPLIER)x)")
+
 @everywhere lammps_path = $LAMMPS_PATH
 @everywhere max_total_iter = $MAX_TOTAL_ITER
 @everywhere mode_recheck_every = $MODE_RECHECK_EVERY
+@everywhere max_phase2_step = $MAX_PHASE2_STEP
 @everywhere begin
     data = parse_lammps_data(lammps_path)
     positions0 = hcat(data["x"], data["y"], data["z"])
@@ -100,6 +120,7 @@ end
             dump_file = dump_path,
             max_total_iter = max_total_iter,
             mode_recheck_every = mode_recheck_every,
+            max_phase2_step = max_phase2_step,
         )
     end
 end
@@ -146,7 +167,8 @@ function run_batch()
     log_io = open(LOG_PATH, "w")
     println(log_io,
         "seed,success,kicked_atom,phase1_iters,total_iters,crit_eigenvalue,initial_energy," *
-        "final_energy,max_phase2_angle_deg,overshoot_energy,overshoot_new_minimum,dump_file,error"
+        "final_energy,max_phase2_angle_deg,phase2_step_size_min,phase2_step_size_max," *
+        "overshoot_energy,overshoot_new_minimum,dump_file,error"
     )
     flush(log_io)
 
@@ -177,12 +199,14 @@ function run_batch()
                 err_field = res.error === nothing ? "" : replace(res.error, "\n" => " | ", "," => ";")
                 dump_field = res.dump_file === nothing ? "" : res.dump_file
                 angle_field = res.max_phase2_angle_deg === nothing ? "" : round(res.max_phase2_angle_deg, digits=2)
+                step_min_field = res.phase2_step_size_min === nothing ? "" : res.phase2_step_size_min
+                step_max_field = res.phase2_step_size_max === nothing ? "" : res.phase2_step_size_max
                 ov_e_field = res.overshoot_energy === nothing ? "" : res.overshoot_energy
                 ov_new_field = res.overshoot_new_minimum === nothing ? "" : res.overshoot_new_minimum
                 println(log_io,
                     "$(res.seed),$(res.success),$(res.kicked_atom),$(res.steps_part1),$(res.iteration)," *
                     "$(res.crit_eigenvalue),$(res.initial_energy),$(res.final_energy),$angle_field," *
-                    "$ov_e_field,$ov_new_field,$dump_field,$err_field"
+                    "$step_min_field,$step_max_field,$ov_e_field,$ov_new_field,$dump_field,$err_field"
                 )
                 flush(log_io)
 
@@ -190,10 +214,12 @@ function run_batch()
                     push!(successes, res)
                     elapsed = round(time() - start_time, digits=1)
                     @printf(
-                        "[%2d/%2d] SUCCESS  seed=%-6d atom=%-5d E=%.6f  iters=%-4d (phase1=%-4d)  max_angle=%.1f°  elapsed=%.1fs  attempts_so_far=%d\n",
+                        "[%2d/%2d] SUCCESS  seed=%-6d atom=%-5d E=%.6f  iters=%-4d (phase1=%-4d)  max_angle=%.1f°  step=[%.5f,%.5f]  elapsed=%.1fs  attempts_so_far=%d\n",
                         length(successes), TARGET_SUCCESSES, res.seed, res.kicked_atom,
                         res.final_energy, res.iteration, res.steps_part1,
-                        something(res.max_phase2_angle_deg, NaN), elapsed, n_attempts
+                        something(res.max_phase2_angle_deg, NaN),
+                        something(res.phase2_step_size_min, NaN), something(res.phase2_step_size_max, NaN),
+                        elapsed, n_attempts
                     )
                 else
                     if res.overshoot_new_minimum == true

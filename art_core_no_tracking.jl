@@ -62,6 +62,9 @@ Base.@kwdef struct AttemptResult
     # the mode-jump symptom; watch this here since phase 2 is back to cold
     # re-diagonalization every iteration
     max_phase2_angle_deg::Union{Float64,Nothing} = nothing
+    # adaptive phase-2 step size diagnostics (nothing if phase 2 never ran)
+    phase2_step_size_min::Union{Float64,Nothing} = nothing
+    phase2_step_size_max::Union{Float64,Nothing} = nothing
 end
 
 function _failed_result(
@@ -98,12 +101,26 @@ end
 
 """
     run_art_attempt(seed, positions0, data, pairs0, box; dump_file=nothing,
-                    max_total_iter=2000, mode_recheck_every=25)
+                    max_total_iter=2000, mode_recheck_every=25,
+                    max_phase2_step=5*move_phase2_modifier)
 
 Run one full ART attempt (random kick -> phase 1 activation -> phase 2
 eigenvector-following) starting from the given relaxed minimum
 `positions0`, using a private RNG seeded with `seed` so results are
 reproducible and independent across parallel attempts.
+
+Phase 2 uses an ADAPTIVE step size, proportional to the force component
+parallel to the current move direction (the same quantity
+`dot_product_saddle_cutoff` already measures as the stopping criterion)
+-- large early in phase 2, on the steep part of the landscape the
+kick just destabilized, shrinking toward `move_phase2_modifier` (the
+previous fixed step) as that parallel force vanishes approaching the
+saddle. The proportionality constant is fixed once, calibrated so the
+very first phase-2 step lands exactly at `max_phase2_step`; every later
+step is `clamp(constant * |parallel_force|, move_phase2_modifier,
+max_phase2_step)`, so it's always bounded in that range regardless of
+how the parallel force actually evolves. `move_phase2_modifier` itself
+(from config.jl) is the floor -- unchanged from before this change.
 
 `mode_recheck_every` is accepted but unused (kept for drop-in
 compatibility with art_core.jl's signature).
@@ -124,6 +141,7 @@ function run_art_attempt(
     dump_file::Union{String,Nothing} = nothing,
     max_total_iter::Int = 2000,
     mode_recheck_every::Int = 25,   # unused, kept for signature compatibility
+    max_phase2_step::Float64 = 5 * move_phase2_modifier,
 )
     rng = MersenneTwister(seed)
     natoms = data["natoms"]
@@ -205,20 +223,35 @@ function run_art_attempt(
         moves = relevant_eigenvector .* move_phase2_modifier
         moves = reshape(moves, 3, :)'
 
+        # calibrate the proportionality constant once, from the parallel
+        # force right at the handoff, so the first phase-2 step lands at
+        # max_phase2_step; every later step is a clamped, self-consistent
+        # rescaling of this same constant (see docstring above)
+        initial_parallel_force = abs(dot(moves, F)) / move_phase2_modifier
+        step_size_coefficient = max_phase2_step / max(initial_parallel_force, 1e-12)
+
         crit_eigenvalue = relevant_eigenvalue
         val = vals
         max_phase2_angle_deg = 0.0
+        step_size = move_phase2_modifier
+        phase2_step_size_min = step_size
+        phase2_step_size_max = step_size
 
         while crit_eigenvalue < 0 &&
               iteration < max_total_iter &&
-              abs(dot(moves, F) / move_phase2_modifier) > dot_product_saddle_cutoff
+              abs(dot(moves, F) / step_size) > dot_product_saddle_cutoff
 
             if iteration % 10 == 0
                 pairs = build_neighbor_pairs(positions, rc, box)
             end
 
             old_moves = copy(moves)
-            moves, val = calculate_moves(positions, data, pairs, F, old_moves, move_phase2_modifier)
+            parallel_force = abs(dot(old_moves, F)) / step_size
+            step_size = clamp(step_size_coefficient * parallel_force, move_phase2_modifier, max_phase2_step)
+            phase2_step_size_min = min(phase2_step_size_min, step_size)
+            phase2_step_size_max = max(phase2_step_size_max, step_size)
+
+            moves, val = calculate_moves(positions, data, pairs, F, old_moves, step_size)
             crit_eigenvalue = val[lowest_nonzero_mode(val)]
 
             angle_deg = rad2deg(angle_between(vec(old_moves'), vec(moves')))
@@ -256,7 +289,7 @@ function run_art_attempt(
             positions = success ? positions : nothing,
             dump_file = success ? dump_file : nothing,
             overshoot_energy, overshoot_new_minimum, overshoot_positions,
-            max_phase2_angle_deg,
+            max_phase2_angle_deg, phase2_step_size_min, phase2_step_size_max,
         )
 
     catch e
