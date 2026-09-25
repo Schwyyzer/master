@@ -23,10 +23,16 @@ converge onto the saddle precisely, not to escape it decisively. Right
 at a saddle the net force is ~0 by construction, so a push that small
 risks relaxing you right back to (numerically) the same point, or
 taking a very long time to diverge either way, telling you nothing.
-PUSH_MAGNITUDE below defaults to first_move_modifier's scale (0.1)
-instead -- already known, from the phase-1 kick elsewhere in this
-codebase, to reliably move the system off a fixed point and into a
-definite basin.
+
+How large a push actually is needed varies a lot: some modes are
+delocalized over many atoms, some (per an earlier real example) put
+~93% of their weight on a single atom, and a fixed guess that works for
+one can be a wild overshoot (straight into a neighbor) for the other.
+So PUSH_MAGNITUDES below is a small LIST of candidate magnitudes,
+scaled so the single MOST-displaced atom moves by that amount -- tried
+smallest-first per side, per saddle, using the first one that relaxes
+without throwing. Widen or adjust this list freely; the point isn't
+this exact list, it's not committing to one guessed number.
 
 Also worth knowing before reading the printed angles: your CSV's
 max_phase2_angle_deg column sitting at ~179-180 degrees for essentially
@@ -67,9 +73,13 @@ LAMMPS_PATH = "FILL_ME_IN"   # the EXACT LAMMPS_PATH value the run_parallel*.jl
                               # wrong file) -- it'll just silently validate against
                               # the wrong starting minimum, so this is deliberately
                               # not defaulted to a guess.
-PUSH_MAGNITUDE = 0.1   # displacement along the unit unstable-mode direction,
-                        # applied in EACH sign -- see file header for why this
-                        # isn't just the dump's own tiny MOVE magnitude
+PUSH_MAGNITUDES = [0.01, 0.02, 0.05, 0.1, 0.2]   # tried in order per side, per
+                        # saddle -- the smallest one that gets that side to
+                        # relax without throwing is used, instead of betting
+                        # everything on one guessed constant (your first two
+                        # dumps showed ~93% of the mode's weight on a single
+                        # atom, so the right push size may vary a lot saddle
+                        # to saddle depending on how localized each mode is)
 RMSD_SAME_THRESHOLD = 0.02   # below this, the two relaxed endpoints are called
                                # "the same configuration". Not a principled
                                # number -- the script always prints the actual
@@ -170,10 +180,50 @@ positions0 = hcat(data0["x"], data0["y"], data0["z"])
 pairs0 = build_neighbor_pairs(positions0, rc, box)
 initial_energy = compute_energy(positions0, data0["cid"], box, epsilon_table, sigma_table, pairs0)
 
+# Sanity check: every row in a given results.csv shares the same starting
+# minimum, so its initial_energy column is one constant value -- if what
+# THIS script just computed (from LAMMPS_PATH + the CURRENT config.jl's rc/
+# epsilon_table/sigma_table) doesn't match that constant, this script is
+# validating against a different potential than the one that actually
+# produced the CSV, and nothing below is trustworthy until that's fixed.
+# Paste the value from your CSV's initial_energy column here:
+KNOWN_CSV_INITIAL_ENERGY = -13010.936594987796
+if abs(initial_energy - KNOWN_CSV_INITIAL_ENERGY) > 1e-6
+    println("*** WARNING: computed initial_energy = $initial_energy")
+    println("*** does NOT match the CSV's recorded initial_energy = $KNOWN_CSV_INITIAL_ENERGY")
+    println("*** (difference = $(initial_energy - KNOWN_CSV_INITIAL_ENERGY))")
+    println("*** LAMMPS_PATH and/or config.jl (rc/epsilon_table/sigma_table) do NOT match")
+    println("*** what actually produced this run -- fix that before trusting anything below.\n")
+else
+    println("initial_energy matches the CSV's recorded value -- LAMMPS_PATH and config.jl")
+    println("are at least consistent with the starting point of this run.\n")
+end
+
 rows = parse_results_csv(RESULTS_CSV)
 successes = filter(r -> r.success, rows)
 println("$(length(successes)) successful saddle(s) to validate out of $(length(rows)) attempts in the CSV")
-println("push magnitude = $PUSH_MAGNITUDE, same-configuration RMSD threshold = $RMSD_SAME_THRESHOLD\n")
+println("push magnitudes tried (per side) = $PUSH_MAGNITUDES, same-configuration RMSD threshold = $RMSD_SAME_THRESHOLD\n")
+
+# Try pushing positions_saddle by `sign * move`, rescaled so the single
+# most-displaced atom moves by each candidate magnitude in turn, until one
+# relaxes without throwing. Returns (success, relaxed_positions, energy,
+# magnitude_used).
+function try_relax_push(positions_saddle, move, max_atom_disp, sign, magnitudes, data, box)
+    for mag in magnitudes
+        push_dir = sign .* move .* (mag / max_atom_disp)
+        pos0 = positions_saddle .+ push_dir
+        try
+            pairs0 = build_neighbor_pairs(pos0, rc, box)
+            pos = relax(pos0, data, pairs0, nothing, box)
+            pairs_final = build_neighbor_pairs(pos, rc, box)
+            e = compute_energy(pos, data["cid"], box, epsilon_table, sigma_table, pairs_final)
+            return true, pos, e, mag
+        catch
+            continue
+        end
+    end
+    return false, nothing, NaN, NaN
+end
 
 n_pass = 0
 n_fail = 0
@@ -198,15 +248,9 @@ for r in successes
         continue
     end
 
-    # Scale so the MOST-displaced single atom moves by PUSH_MAGNITUDE, not so
-    # the whole flattened 3N-vector has norm PUSH_MAGNITUDE. Those are very
-    # different things once the eigenvector is delocalized over many atoms
-    # (typical for a 1000+-atom system): normalizing the whole vector to
-    # unit norm, then scaling by 0.1, can leave each individual atom moving
-    # by only a small fraction of 0.1 -- nothing like first_move_modifier's
-    # actual per-atom kick size, which this was meant to match. Scaling by
-    # the max single-atom displacement instead makes PUSH_MAGNITUDE mean the
-    # same thing regardless of how delocalized the mode is.
+    # Rescale by the MOST-displaced single atom, not the whole flattened 3N-
+    # vector's norm -- see the header note on delocalization. Direction sign
+    # is handled inside try_relax_push, not baked in here.
     per_atom_disp = sqrt.(sum(move .^ 2, dims=2))   # Nx1
     max_atom_disp = maximum(per_atom_disp)
     if max_atom_disp < 1e-14
@@ -214,24 +258,21 @@ for r in successes
         global n_error += 1
         continue
     end
-    push_dir = move .* (PUSH_MAGNITUDE / max_atom_disp)
     print("  (raw max per-atom |move| in dump = $(round(max_atom_disp, digits=6)))")
 
     data = data0   # cid/id are identical (checked above); only positions differ per-call,
                     # and those are always passed explicitly, so this is safe to share
 
     try
-        pos_plus0 = positions_saddle .+ push_dir
-        pairs_plus0 = build_neighbor_pairs(pos_plus0, rc, box)
-        pos_plus = relax(pos_plus0, data, pairs_plus0, nothing, box)
-        pairs_plus_final = build_neighbor_pairs(pos_plus, rc, box)
-        e_plus = compute_energy(pos_plus, data["cid"], box, epsilon_table, sigma_table, pairs_plus_final)
+        ok_plus, pos_plus, e_plus, mag_plus = try_relax_push(positions_saddle, move, max_atom_disp, 1.0, PUSH_MAGNITUDES, data, box)
+        ok_minus, pos_minus, e_minus, mag_minus = try_relax_push(positions_saddle, move, max_atom_disp, -1.0, PUSH_MAGNITUDES, data, box)
 
-        pos_minus0 = positions_saddle .- push_dir
-        pairs_minus0 = build_neighbor_pairs(pos_minus0, rc, box)
-        pos_minus = relax(pos_minus0, data, pairs_minus0, nothing, box)
-        pairs_minus_final = build_neighbor_pairs(pos_minus, rc, box)
-        e_minus = compute_energy(pos_minus, data["cid"], box, epsilon_table, sigma_table, pairs_minus_final)
+        if !ok_plus || !ok_minus
+            which = !ok_plus && !ok_minus ? "both sides" : (!ok_plus ? "the + side" : "the - side")
+            println("\n  FAILED: $which never relaxed cleanly at any of $PUSH_MAGNITUDES\n")
+            global n_error += 1
+            continue
+        end
 
         rmsd_plus_minus = com_removed_rmsd(pos_plus, pos_minus, box_vec)
         rmsd_plus_start = com_removed_rmsd(pos_plus, positions0, box_vec)
@@ -244,20 +285,25 @@ for r in successes
         global n_fail += !is_different
 
         @printf(
-            "\n  E_plus=%.6f  E_minus=%.6f  (saddle E=%.6f, barrier=%.6f)\n  RMSD(plus,minus)=%.5f  RMSD(plus,start)=%.5f  RMSD(minus,start)=%.5f\n  %s\n\n",
-            e_plus, e_minus, r.final_energy, r.final_energy - initial_energy,
+            "\n  push_used=[+%.3g,-%.3g]  E_plus=%.6f  E_minus=%.6f  (saddle E=%.6f, barrier=%.6f)\n  RMSD(plus,minus)=%.5f  RMSD(plus,start)=%.5f  RMSD(minus,start)=%.5f\n  %s\n\n",
+            mag_plus, mag_minus, e_plus, e_minus, r.final_energy, r.final_energy - initial_energy,
             rmsd_plus_minus, rmsd_plus_start, rmsd_minus_start,
             verdict
         )
     catch e
-        println("\n  ERROR during push/relax: $(sprint(showerror, e))\n")
+        println("\n  ERROR: $(sprint(showerror, e))\n")
         global n_error += 1
     end
 end
 
 println("=== Summary: $n_pass confirmed / $n_fail suspicious / $n_error skipped, out of $(length(successes)) successes ===")
 if n_fail > 0
-    println("Suspicious ones are worth a second look -- try a larger PUSH_MAGNITUDE first")
-    println("(the displacement may simply have been too small to escape the saddle's")
+    println("Suspicious ones are worth a second look -- try widening PUSH_MAGNITUDES with some")
+    println("larger values first (the range tried may simply not have escaped the saddle's")
     println("immediate neighborhood) before concluding the search criteria are too loose.")
+end
+if n_error > 0
+    println("$n_error skipped/failed -- if these are all 'never relaxed cleanly at any of")
+    println("PUSH_MAGNITUDES', re-check the initial_energy match printed above first: a")
+    println("config/LAMMPS_PATH mismatch would produce exactly this kind of uniform failure.")
 end
