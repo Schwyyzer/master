@@ -198,25 +198,36 @@ for r in successes
         continue
     end
 
-    move_norm = sqrt(sum(move .^ 2))
-    if move_norm < 1e-14
+    # Scale so the MOST-displaced single atom moves by PUSH_MAGNITUDE, not so
+    # the whole flattened 3N-vector has norm PUSH_MAGNITUDE. Those are very
+    # different things once the eigenvector is delocalized over many atoms
+    # (typical for a 1000+-atom system): normalizing the whole vector to
+    # unit norm, then scaling by 0.1, can leave each individual atom moving
+    # by only a small fraction of 0.1 -- nothing like first_move_modifier's
+    # actual per-atom kick size, which this was meant to match. Scaling by
+    # the max single-atom displacement instead makes PUSH_MAGNITUDE mean the
+    # same thing regardless of how delocalized the mode is.
+    per_atom_disp = sqrt.(sum(move .^ 2, dims=2))   # Nx1
+    max_atom_disp = maximum(per_atom_disp)
+    if max_atom_disp < 1e-14
         println("  SKIPPED (MOVE vector in dump is ~zero, nothing to push along)")
         global n_error += 1
         continue
     end
-    unit_move = move ./ move_norm
+    push_dir = move .* (PUSH_MAGNITUDE / max_atom_disp)
+    print("  (raw max per-atom |move| in dump = $(round(max_atom_disp, digits=6)))")
 
     data = data0   # cid/id are identical (checked above); only positions differ per-call,
                     # and those are always passed explicitly, so this is safe to share
 
     try
-        pos_plus0 = positions_saddle .+ PUSH_MAGNITUDE .* unit_move
+        pos_plus0 = positions_saddle .+ push_dir
         pairs_plus0 = build_neighbor_pairs(pos_plus0, rc, box)
         pos_plus = relax(pos_plus0, data, pairs_plus0, nothing, box)
         pairs_plus_final = build_neighbor_pairs(pos_plus, rc, box)
         e_plus = compute_energy(pos_plus, data["cid"], box, epsilon_table, sigma_table, pairs_plus_final)
 
-        pos_minus0 = positions_saddle .- PUSH_MAGNITUDE .* unit_move
+        pos_minus0 = positions_saddle .- push_dir
         pairs_minus0 = build_neighbor_pairs(pos_minus0, rc, box)
         pos_minus = relax(pos_minus0, data, pairs_minus0, nothing, box)
         pairs_minus_final = build_neighbor_pairs(pos_minus, rc, box)
