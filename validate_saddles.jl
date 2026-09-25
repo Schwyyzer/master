@@ -233,9 +233,7 @@ for r in successes
         global n_fail += !is_different
 
         @printf(
-            "\n  E_plus=%.6f  E_minus=%.6f  (saddle E=%.6f, barrier=%.6f)\n" *
-            "  RMSD(plus,minus)=%.5f  RMSD(plus,start)=%.5f  RMSD(minus,start)=%.5f\n" *
-            "  %s\n\n",
+            "\n  E_plus=%.6f  E_minus=%.6f  (saddle E=%.6f, barrier=%.6f)\n  RMSD(plus,minus)=%.5f  RMSD(plus,start)=%.5f  RMSD(minus,start)=%.5f\n  %s\n\n",
             e_plus, e_minus, r.final_energy, r.final_energy - initial_energy,
             rmsd_plus_minus, rmsd_plus_start, rmsd_minus_start,
             verdict
