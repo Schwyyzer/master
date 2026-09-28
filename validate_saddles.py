@@ -297,6 +297,33 @@ def max_atom_displacement(a, b, box):
     return np.max(np.linalg.norm(dr, axis=1))
 
 
+def cluster_by_max_disp(configs, box, threshold):
+    """Greedy clustering of a list of configurations (each an Nx3 array,
+    same atom count/order): a config joins the first existing cluster
+    whose representative (its first member) is within `threshold`
+    max_atom_displacement, else it starts a new cluster. Returns
+    (labels, n_clusters) where labels[i] is the cluster index of
+    configs[i]. Used to test whether the SADDLE POINTS THEMSELVES (not
+    their push/relax endpoints) are actually distinct from each other --
+    a uniform max_atom_disp and a small set of repeating energies across
+    unrelated seeds (different kicked atoms) is the signature of an ART
+    search rediscovering the same handful of transitions over and over,
+    not 50 genuinely different ones."""
+    reps = []
+    labels = []
+    for pos in configs:
+        assigned = None
+        for ci, rep in enumerate(reps):
+            if max_atom_displacement(pos, rep, box) < threshold:
+                assigned = ci
+                break
+        if assigned is None:
+            reps.append(pos)
+            assigned = len(reps) - 1
+        labels.append(assigned)
+    return labels, len(reps)
+
+
 def find_decisive_push(positions_saddle, move, max_atom_disp, magnitudes, max_disp_threshold, data, box):
     """
     Push BOTH sides by the SAME magnitude each round, starting from the
@@ -394,6 +421,8 @@ def main():
           f"same-configuration max-atom-displacement threshold = {MAX_ATOM_DISP_SAME_THRESHOLD}\n")
 
     n_pass = n_fail = n_error = 0
+    saddle_seeds = []
+    saddle_positions = []
 
     for r in successes:
         line = f"seed={r['seed']}  dump={r['dump_file']}"
@@ -409,6 +438,9 @@ def main():
                   f"wrong LAMMPS_PATH for this run?)")
             n_error += 1
             continue
+
+        saddle_seeds.append(r["seed"])
+        saddle_positions.append(positions_saddle)
 
         per_atom_disp = np.linalg.norm(move, axis=1)
         max_atom_disp = per_atom_disp.max()
@@ -469,6 +501,33 @@ def main():
         print(f"{n_error} skipped/failed -- if these are all 'never relaxed cleanly at any of")
         print("PUSH_MAGNITUDES', re-check the initial_energy match printed above first: a")
         print("config/LAMMPS_PATH mismatch would produce exactly this kind of uniform failure.")
+
+    # =================================================================
+    # Are the SADDLE POINTS THEMSELVES distinct from each other, or is
+    # this ART search mostly rediscovering the same handful of
+    # transitions? Compares each dump's saddle positions directly --
+    # no push/relax involved -- so this is independent of everything
+    # above. A uniform max_atom_disp(plus,minus) and a small set of
+    # repeating "far" energies across unrelated seeds (different kicked
+    # atoms) in the per-saddle output above is exactly what this would
+    # also show as low cluster diversity.
+    # =================================================================
+    if len(saddle_positions) >= 2:
+        labels, n_clusters = cluster_by_max_disp(saddle_positions, box, MAX_ATOM_DISP_SAME_THRESHOLD)
+        print(f"\n=== Saddle-point diversity: {n_clusters} distinct cluster(s) "
+              f"among {len(saddle_positions)} saddles (threshold={MAX_ATOM_DISP_SAME_THRESHOLD}) ===")
+        from collections import defaultdict
+        by_cluster = defaultdict(list)
+        for seed, label in zip(saddle_seeds, labels):
+            by_cluster[label].append(seed)
+        for ci in sorted(by_cluster, key=lambda c: -len(by_cluster[c])):
+            seeds = by_cluster[ci]
+            print(f"  cluster {ci}: {len(seeds)} saddle(s) -- seeds {seeds}")
+        if n_clusters < len(saddle_positions) / 2:
+            print("Fewer clusters than half the saddle count: this ART search is substantially")
+            print("rediscovering the same handful of transitions rather than finding distinct")
+            print("saddle points -- worth revisiting phase-1 direction selection / kick-direction")
+            print("continuity (diagnosed earlier as the low-diversity issue, not yet addressed).")
 
 
 if __name__ == "__main__":
