@@ -29,14 +29,22 @@ DISPLACED atom moves by that amount (not the whole flattened 3N-vector's
 norm -- those are very different once a mode is delocalized, and one
 real example showed ~93% of a mode's weight on a single atom).
 
-IMPORTANT: escalation stops on DECISIVE divergence (RMSD(plus,minus) >
-RMSD_SAME_THRESHOLD), not merely on "relax() didn't throw" -- a push too
-small to escape the saddle's own neighborhood relaxes right back to
-(nearly) the same point on both sides without ever raising an exception,
-so treating "no exception" as success (an earlier version of this script
-did) silently settles for the smallest, least conclusive magnitude every
-time and reports every saddle as "suspicious" regardless of whether it's
-real. See find_decisive_push's docstring for the exact logic.
+IMPORTANT #1: escalation stops on DECISIVE divergence, not merely on
+"relax() didn't throw" -- a push too small to escape the saddle's own
+neighborhood relaxes right back to (nearly) the same point on both sides
+without ever raising an exception, so treating "no exception" as success
+(an earlier version of this script did) silently settles for the
+smallest, least conclusive magnitude every time and reports every saddle
+as "suspicious" regardless of whether it's real.
+
+IMPORTANT #2: "decisive" is judged by max_atom_displacement (the largest
+single per-atom displacement between the two relaxed endpoints), not
+whole-system RMSD (an even earlier version of this script used RMSD).
+On a 1700+-atom system with a transition localized to ~1 atom, a real
+hop dilutes in whole-system-RMSD terms by ~sqrt(natoms) -- easily
+burying a completely genuine transition under a plausible-looking
+threshold. See find_decisive_push's docstring for the numbers this was
+calibrated against and the exact escalation logic.
 """
 import csv
 import numpy as np
@@ -67,7 +75,20 @@ PUSH_MAGNITUDES = [0.01, 0.02, 0.05, 0.1, 0.2, 0.35, 0.5]   # tried smallest-fir
                                                     # per saddle, escalating on non-
                                                     # decisive (not merely non-crashing)
                                                     # results -- see module docstring
-RMSD_SAME_THRESHOLD = 0.02                         # below this: "same configuration"
+
+# Decisiveness is judged by the single LARGEST per-atom displacement between
+# the two relaxed endpoints, not whole-system RMSD -- see
+# find_decisive_push's docstring for why (RMSD dilutes a localized
+# single-atom hop by sqrt(natoms), easily burying a completely real
+# transition under a naive threshold on a 1700+-atom system). Back-
+# calculating from an actual run: rows that "returned to start" showed
+# whole-system RMSD ~0.0001, rows that (per the energies) genuinely
+# landed somewhere else showed whole-system RMSD ~0.005 -- consistent
+# with one atom hopping by roughly RMSD*sqrt(1728) =~ 0.2. This default
+# sits well below that real-hop scale and well above the numerical-noise
+# scale; MAX_DISP_PLUS_MINUS is printed for every saddle so you can
+# sanity check/adjust it against your own data.
+MAX_ATOM_DISP_SAME_THRESHOLD = 0.05
 
 
 # =====================================================================
@@ -260,20 +281,48 @@ def com_removed_rmsd(a, b, box):
     return np.sqrt(np.mean(np.sum(dr**2, axis=1)))
 
 
-def find_decisive_push(positions_saddle, move, max_atom_disp, magnitudes, rmsd_threshold, data, box):
+def max_atom_displacement(a, b, box):
+    """Largest single-atom displacement between two configurations
+    (minimum-image). Unlike com_removed_rmsd, this does NOT get diluted
+    by system size -- a real single-atom hop in a 1728-atom system moves
+    ONE atom by a real amount and leaves the other 1727 essentially
+    where they were; the whole-system RMSD divides by all 1728 atoms and
+    can bury that signal under the detection threshold (a hop of ~0.2
+    dilutes to ~0.2/sqrt(1728) =~ 0.005 in RMSD terms). This metric
+    answers "did at least one atom end up somewhere meaningfully
+    different" directly, which is the actually relevant question for a
+    localized transition."""
+    dr = a - b
+    dr -= box * np.round(dr / box)
+    return np.max(np.linalg.norm(dr, axis=1))
+
+
+def find_decisive_push(positions_saddle, move, max_atom_disp, magnitudes, max_disp_threshold, data, box):
     """
     Push BOTH sides by the SAME magnitude each round, starting from the
     smallest in `magnitudes` and escalating.
 
-    IMPORTANT: a magnitude only counts as "done" if the two relaxed
-    endpoints are DECISIVELY different (RMSD > rmsd_threshold) -- not
-    merely because relax() didn't throw. A push too small to escape the
-    saddle's own neighborhood relaxes right back to (nearly) the same
-    point on both sides *without ever raising an exception*, so "no
-    error" is not evidence of anything; stopping on that basis (an
-    earlier version of this script did) silently settles for the
-    smallest, least conclusive magnitude every time and reports
-    "suspicious" universally regardless of whether the saddles are real.
+    IMPORTANT #1: a magnitude only counts as "done" if the two relaxed
+    endpoints are DECISIVELY different -- not merely because relax()
+    didn't throw. A push too small to escape the saddle's own
+    neighborhood relaxes right back to (nearly) the same point on both
+    sides *without ever raising an exception*, so "no error" is not
+    evidence of anything; stopping on that basis (an earlier version of
+    this script did) silently settles for the smallest, least
+    conclusive magnitude every time and reports "suspicious" universally
+    regardless of whether the saddles are real.
+
+    IMPORTANT #2: "decisively different" is judged by max_atom_displacement
+    (the single largest per-atom displacement between the two relaxed
+    endpoints), NOT the whole-system COM-removed RMSD. On a system with
+    ~1700+ atoms and a transition localized to essentially one atom (per
+    the earlier ~93%-weight-on-one-atom finding), a real hop of e.g. 0.2
+    dilutes to only ~0.2/sqrt(1728) =~ 0.005 in whole-system RMSD terms
+    -- comfortably under a naive threshold like 0.02 even though it's a
+    completely real, decisive transition. max_atom_displacement answers
+    "did at least one atom end up somewhere meaningfully different"
+    directly, without that dilution. com_removed_rmsd is still computed
+    and returned for reference/diagnostics.
 
     Escalates to the next larger magnitude whenever the current one
     isn't decisive, and stops escalating (reporting the last magnitude
@@ -283,8 +332,8 @@ def find_decisive_push(positions_saddle, move, max_atom_disp, magnitudes, rmsd_t
     larger magnitude wouldn't add information.
 
     Returns a dict with mag, pos_plus, pos_minus, e_plus, e_minus,
-    rmsd_plus_minus, decisive (bool) -- or None if nothing relaxed
-    cleanly even at the smallest magnitude.
+    rmsd_plus_minus, max_disp_plus_minus, decisive (bool) -- or None if
+    nothing relaxed cleanly even at the smallest magnitude.
     """
     last_result = None
     for mag in magnitudes:
@@ -300,12 +349,14 @@ def find_decisive_push(positions_saddle, move, max_atom_disp, magnitudes, rmsd_t
         e_plus = compute_energy(pos_plus, data["cid"], box, pairs_plus)
         e_minus = compute_energy(pos_minus, data["cid"], box, pairs_minus)
         rmsd_plus_minus = com_removed_rmsd(pos_plus, pos_minus, box)
+        max_disp_plus_minus = max_atom_displacement(pos_plus, pos_minus, box)
 
         last_result = {
             "mag": mag, "pos_plus": pos_plus, "pos_minus": pos_minus,
             "e_plus": e_plus, "e_minus": e_minus,
             "rmsd_plus_minus": rmsd_plus_minus,
-            "decisive": rmsd_plus_minus > rmsd_threshold,
+            "max_disp_plus_minus": max_disp_plus_minus,
+            "decisive": max_disp_plus_minus > max_disp_threshold,
         }
         if last_result["decisive"]:
             return last_result
@@ -340,7 +391,7 @@ def main():
     successes = [r for r in rows if r["success"]]
     print(f"{len(successes)} successful saddle(s) to validate out of {len(rows)} attempts in the CSV")
     print(f"push magnitudes tried (per side) = {PUSH_MAGNITUDES}, "
-          f"same-configuration RMSD threshold = {RMSD_SAME_THRESHOLD}\n")
+          f"same-configuration max-atom-displacement threshold = {MAX_ATOM_DISP_SAME_THRESHOLD}\n")
 
     n_pass = n_fail = n_error = 0
 
@@ -369,7 +420,7 @@ def main():
 
         try:
             result = find_decisive_push(
-                positions_saddle, move, max_atom_disp, PUSH_MAGNITUDES, RMSD_SAME_THRESHOLD, data0, box)
+                positions_saddle, move, max_atom_disp, PUSH_MAGNITUDES, MAX_ATOM_DISP_SAME_THRESHOLD, data0, box)
 
             if result is None:
                 print(f"{line}\n  FAILED: never relaxed cleanly on both sides at any of {PUSH_MAGNITUDES}\n")
@@ -380,6 +431,7 @@ def main():
             pos_plus, pos_minus = result["pos_plus"], result["pos_minus"]
             e_plus, e_minus = result["e_plus"], result["e_minus"]
             rmsd_plus_minus = result["rmsd_plus_minus"]
+            max_disp_plus_minus = result["max_disp_plus_minus"]
             rmsd_plus_start = com_removed_rmsd(pos_plus, positions0, box)
             rmsd_minus_start = com_removed_rmsd(pos_minus, positions0, box)
 
@@ -396,8 +448,9 @@ def main():
                   f"  push_used=+-{mag:.3g}{'  (largest tried)' if mag == PUSH_MAGNITUDES[-1] else ''}  "
                   f"E_plus={e_plus:.6f}  E_minus={e_minus:.6f}  "
                   f"(saddle E={r['final_energy']:.6f}, barrier={r['final_energy'] - initial_energy:.6f})\n"
-                  f"  RMSD(plus,minus)={rmsd_plus_minus:.5f}  "
-                  f"RMSD(plus,start)={rmsd_plus_start:.5f}  "
+                  f"  max_atom_disp(plus,minus)={max_disp_plus_minus:.5f}  "
+                  f"[whole-system RMSD(plus,minus)={rmsd_plus_minus:.5f}]\n"
+                  f"  RMSD(plus,start)={rmsd_plus_start:.5f}  "
                   f"RMSD(minus,start)={rmsd_minus_start:.5f}\n"
                   f"  {verdict}\n")
         except Exception as e:
