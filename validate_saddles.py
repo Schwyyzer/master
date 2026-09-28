@@ -24,11 +24,19 @@ SIGMA_TABLE/LAMMPS_PATH first -- nothing below is trustworthy until that
 check passes.
 
 Push magnitude: rather than one guessed constant, PUSH_MAGNITUDES is a
-list tried smallest-first per side per saddle, scaled so the SINGLE
-MOST-DISPLACED atom moves by that amount (not the whole flattened
-3N-vector's norm -- those are very different once a mode is delocalized,
-and one real example showed ~93% of a mode's weight on a single atom).
-The first magnitude that relaxes cleanly (no force blowup) is used.
+list tried smallest-first per saddle, scaled so the SINGLE MOST-
+DISPLACED atom moves by that amount (not the whole flattened 3N-vector's
+norm -- those are very different once a mode is delocalized, and one
+real example showed ~93% of a mode's weight on a single atom).
+
+IMPORTANT: escalation stops on DECISIVE divergence (RMSD(plus,minus) >
+RMSD_SAME_THRESHOLD), not merely on "relax() didn't throw" -- a push too
+small to escape the saddle's own neighborhood relaxes right back to
+(nearly) the same point on both sides without ever raising an exception,
+so treating "no exception" as success (an earlier version of this script
+did) silently settles for the smallest, least conclusive magnitude every
+time and reports every saddle as "suspicious" regardless of whether it's
+real. See find_decisive_push's docstring for the exact logic.
 """
 import csv
 import numpy as np
@@ -55,8 +63,10 @@ RELAXATION_STEP_MAGNITUDE = 0.0005
 
 KNOWN_CSV_INITIAL_ENERGY = -13010.936594987796   # from your CSV's initial_energy column
 
-PUSH_MAGNITUDES = [0.01, 0.02, 0.05, 0.1, 0.2]    # tried smallest-first, per side,
-                                                    # per saddle -- see module docstring
+PUSH_MAGNITUDES = [0.01, 0.02, 0.05, 0.1, 0.2, 0.35, 0.5]   # tried smallest-first,
+                                                    # per saddle, escalating on non-
+                                                    # decisive (not merely non-crashing)
+                                                    # results -- see module docstring
 RMSD_SAME_THRESHOLD = 0.02                         # below this: "same configuration"
 
 
@@ -250,21 +260,57 @@ def com_removed_rmsd(a, b, box):
     return np.sqrt(np.mean(np.sum(dr**2, axis=1)))
 
 
-def try_relax_push(positions_saddle, move, max_atom_disp, sign, magnitudes, data, box):
-    """Try pushing by sign*move, rescaled so the most-displaced atom moves by
-    each candidate magnitude in turn, until one relaxes without blowing up.
-    Returns (success, relaxed_positions, energy, magnitude_used)."""
+def find_decisive_push(positions_saddle, move, max_atom_disp, magnitudes, rmsd_threshold, data, box):
+    """
+    Push BOTH sides by the SAME magnitude each round, starting from the
+    smallest in `magnitudes` and escalating.
+
+    IMPORTANT: a magnitude only counts as "done" if the two relaxed
+    endpoints are DECISIVELY different (RMSD > rmsd_threshold) -- not
+    merely because relax() didn't throw. A push too small to escape the
+    saddle's own neighborhood relaxes right back to (nearly) the same
+    point on both sides *without ever raising an exception*, so "no
+    error" is not evidence of anything; stopping on that basis (an
+    earlier version of this script did) silently settles for the
+    smallest, least conclusive magnitude every time and reports
+    "suspicious" universally regardless of whether the saddles are real.
+
+    Escalates to the next larger magnitude whenever the current one
+    isn't decisive, and stops escalating (reporting the last magnitude
+    that relaxed on both sides, decisive or not) once a magnitude makes
+    either side throw -- at that point the run has left the local basin
+    structure the earlier decisive-or-not results were sampling, so a
+    larger magnitude wouldn't add information.
+
+    Returns a dict with mag, pos_plus, pos_minus, e_plus, e_minus,
+    rmsd_plus_minus, decisive (bool) -- or None if nothing relaxed
+    cleanly even at the smallest magnitude.
+    """
+    last_result = None
     for mag in magnitudes:
-        push_dir = sign * move * (mag / max_atom_disp)
-        pos0 = positions_saddle + push_dir
+        push = move * (mag / max_atom_disp)
         try:
-            pos = relax_unconstrained(pos0, data, box)
-            pairs_final = build_neighbor_pairs(pos, RC, box)
-            e = compute_energy(pos, data["cid"], box, pairs_final)
-            return True, pos, e, mag
+            pos_plus = relax_unconstrained(positions_saddle + push, data, box)
+            pos_minus = relax_unconstrained(positions_saddle - push, data, box)
         except ArithmeticError:
-            continue
-    return False, None, float("nan"), float("nan")
+            break
+
+        pairs_plus = build_neighbor_pairs(pos_plus, RC, box)
+        pairs_minus = build_neighbor_pairs(pos_minus, RC, box)
+        e_plus = compute_energy(pos_plus, data["cid"], box, pairs_plus)
+        e_minus = compute_energy(pos_minus, data["cid"], box, pairs_minus)
+        rmsd_plus_minus = com_removed_rmsd(pos_plus, pos_minus, box)
+
+        last_result = {
+            "mag": mag, "pos_plus": pos_plus, "pos_minus": pos_minus,
+            "e_plus": e_plus, "e_minus": e_minus,
+            "rmsd_plus_minus": rmsd_plus_minus,
+            "decisive": rmsd_plus_minus > rmsd_threshold,
+        }
+        if last_result["decisive"]:
+            return last_result
+
+    return last_result
 
 
 # =====================================================================
@@ -322,30 +368,32 @@ def main():
         line += f"  (raw max per-atom |move| in dump = {max_atom_disp:.6g})"
 
         try:
-            ok_plus, pos_plus, e_plus, mag_plus = try_relax_push(
-                positions_saddle, move, max_atom_disp, 1.0, PUSH_MAGNITUDES, data0, box)
-            ok_minus, pos_minus, e_minus, mag_minus = try_relax_push(
-                positions_saddle, move, max_atom_disp, -1.0, PUSH_MAGNITUDES, data0, box)
+            result = find_decisive_push(
+                positions_saddle, move, max_atom_disp, PUSH_MAGNITUDES, RMSD_SAME_THRESHOLD, data0, box)
 
-            if not ok_plus or not ok_minus:
-                which = ("both sides" if not ok_plus and not ok_minus
-                         else "the + side" if not ok_plus else "the - side")
-                print(f"{line}\n  FAILED: {which} never relaxed cleanly at any of {PUSH_MAGNITUDES}\n")
+            if result is None:
+                print(f"{line}\n  FAILED: never relaxed cleanly on both sides at any of {PUSH_MAGNITUDES}\n")
                 n_error += 1
                 continue
 
-            rmsd_plus_minus = com_removed_rmsd(pos_plus, pos_minus, box)
+            mag = result["mag"]
+            pos_plus, pos_minus = result["pos_plus"], result["pos_minus"]
+            e_plus, e_minus = result["e_plus"], result["e_minus"]
+            rmsd_plus_minus = result["rmsd_plus_minus"]
             rmsd_plus_start = com_removed_rmsd(pos_plus, positions0, box)
             rmsd_minus_start = com_removed_rmsd(pos_minus, positions0, box)
 
-            is_different = rmsd_plus_minus > RMSD_SAME_THRESHOLD
+            is_different = result["decisive"]
+            exhausted = (not is_different) and (mag == PUSH_MAGNITUDES[-1])
             verdict = ("PASS -- two distinct minima" if is_different else
-                       "SUSPICIOUS -- both sides relaxed to (nearly) the same configuration")
+                       "SUSPICIOUS -- both sides relaxed to (nearly) the same configuration" +
+                       (" (exhausted all push magnitudes)" if exhausted else
+                        f" (stopped escalating: mag={mag} was the last to relax on both sides)"))
             n_pass += is_different
             n_fail += not is_different
 
             print(f"{line}\n"
-                  f"  push_used=[+{mag_plus:.3g},-{mag_minus:.3g}]  "
+                  f"  push_used=+-{mag:.3g}{'  (largest tried)' if mag == PUSH_MAGNITUDES[-1] else ''}  "
                   f"E_plus={e_plus:.6f}  E_minus={e_minus:.6f}  "
                   f"(saddle E={r['final_energy']:.6f}, barrier={r['final_energy'] - initial_energy:.6f})\n"
                   f"  RMSD(plus,minus)={rmsd_plus_minus:.5f}  "
@@ -359,8 +407,11 @@ def main():
     print(f"=== Summary: {n_pass} confirmed / {n_fail} suspicious / {n_error} skipped, "
           f"out of {len(successes)} successes ===")
     if n_fail > 0:
-        print("Suspicious ones are worth a second look -- try widening PUSH_MAGNITUDES with some")
-        print("larger values first before concluding the search criteria are too loose.")
+        print("Suspicious ones already escalated through all of PUSH_MAGNITUDES without ever")
+        print("seeing decisive divergence (see 'exhausted all push magnitudes' vs. 'stopped")
+        print("escalating' in each line above -- the latter means a larger push started")
+        print("blowing up before ever deciding, worth extending PUSH_MAGNITUDES further with")
+        print("smaller steps between values; the former genuinely tried the whole range).")
     if n_error > 0:
         print(f"{n_error} skipped/failed -- if these are all 'never relaxed cleanly at any of")
         print("PUSH_MAGNITUDES', re-check the initial_energy match printed above first: a")
