@@ -125,6 +125,15 @@ how the parallel force actually evolves. `move_phase2_modifier` itself
 `mode_recheck_every` is accepted but unused (kept for drop-in
 compatibility with art_core.jl's signature).
 
+`saddle_eigenvalue_tolerance` (default 0.01): success requires
+`crit_eigenvalue < saddle_eigenvalue_tolerance`, not strictly `< 0`. The
+phase-2 loop only re-checks crit_eigenvalue AFTER taking a step, so on a
+smoothly-converging search it routinely overshoots the true zero-crossing
+by a small amount on the final step; a small positive tolerance here
+keeps every case a strict `< 0` check already accepted (any negative
+value at all) and additionally accepts landing just past zero, instead
+of rejecting a genuinely converged saddle over a discretization artifact.
+
 `positions0`, `data`, `pairs0`, `box` are all read-only here (relax()
 mutates its own local copy, never the caller's array).
 
@@ -142,6 +151,7 @@ function run_art_attempt(
     max_total_iter::Int = 2000,
     mode_recheck_every::Int = 25,   # unused, kept for signature compatibility
     max_phase2_step::Float64 = 5 * move_phase2_modifier,
+    saddle_eigenvalue_tolerance::Float64 = 0.01,
 )
     rng = MersenneTwister(seed)
     natoms = data["natoms"]
@@ -267,7 +277,23 @@ function run_art_attempt(
         final_energy = compute_energy(
             positions, data["cid"], box, epsilon_table, sigma_table, pairs
         )
-        success = crit_eigenvalue < 0 && iteration < max_total_iter && (iteration - steps_part1) > 0
+        # crit_eigenvalue < saddle_eigenvalue_tolerance, not strictly < 0: the
+        # phase-2 loop only checks crit_eigenvalue AFTER taking a step, so it
+        # structurally always takes one step too many -- on systems where
+        # phase 2 converges smoothly (angle between successive moves shrinking
+        # steadily toward 0, eigenvalue delta shrinking every step), that
+        # last step routinely overshoots the true zero-crossing by a tiny
+        # amount (observed: +0.0004 to +0.006, on a search that ranged over
+        # several full eigenvalue units), landing a hair on the wrong side of
+        # a strictly-negative check despite being a completely genuine,
+        # converged saddle. saddle_eigenvalue_tolerance is a small POSITIVE
+        # number (default 0.01), not an absolute-value check: it keeps every
+        # case the old `< 0` check already accepted (any negative value, no
+        # matter how large in magnitude) and additionally accepts landing
+        # just past zero, instead of wrongly rejecting a converged saddle
+        # over a discretization artifact this small relative to the search's
+        # own dynamic range.
+        success = crit_eigenvalue < saddle_eigenvalue_tolerance && iteration < max_total_iter && (iteration - steps_part1) > 0
 
         if success && dump_file !== nothing
             open(dump_file, "w") do io end

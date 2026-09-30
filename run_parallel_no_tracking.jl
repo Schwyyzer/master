@@ -70,6 +70,16 @@ MAX_PHASE2_STEP_MULTIPLIER = 5.0          # ceiling on the adaptive phase-2 step
                                            # (Actual MAX_PHASE2_STEP is computed below,
                                            # once config.jl -- and so move_phase2_modifier
                                            # -- has actually been loaded.)
+SADDLE_EIGENVALUE_TOLERANCE = 0.01        # success requires crit_eigenvalue < this, not
+                                           # strictly < 0 -- on a smoothly-converging search
+                                           # the discrete phase-2 loop routinely overshoots
+                                           # the true zero-crossing by a small amount on its
+                                           # last step (observed: +0.0004 to +0.006), which
+                                           # a strict < 0 check wrongly rejects as failure
+                                           # despite being a genuinely converged saddle. This
+                                           # is a small POSITIVE tolerance, not a magnitude
+                                           # check -- it still accepts every case the old
+                                           # check did (any negative value, however large).
 
 OUTPUT_DIR = "//home//schwyyzer//Desktop//Master Thesis//parallel_art_run_$(Dates.format(now(), "yyyymmdd_HHMMSS"))"
 DUMP_DIR = joinpath(OUTPUT_DIR, "dumps")
@@ -104,6 +114,7 @@ println("phase-2 adaptive step size: floor=$move_phase2_modifier  ceiling=$MAX_P
 @everywhere max_total_iter = $MAX_TOTAL_ITER
 @everywhere mode_recheck_every = $MODE_RECHECK_EVERY
 @everywhere max_phase2_step = $MAX_PHASE2_STEP
+@everywhere saddle_eigenvalue_tolerance = $SADDLE_EIGENVALUE_TOLERANCE
 @everywhere begin
     data = parse_lammps_data(lammps_path)
     positions0 = hcat(data["x"], data["y"], data["z"])
@@ -121,6 +132,7 @@ println("phase-2 adaptive step size: floor=$move_phase2_modifier  ceiling=$MAX_P
             max_total_iter = max_total_iter,
             mode_recheck_every = mode_recheck_every,
             max_phase2_step = max_phase2_step,
+            saddle_eigenvalue_tolerance = saddle_eigenvalue_tolerance,
         )
     end
 end
