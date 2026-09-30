@@ -127,8 +127,19 @@ function compute_energy(positions, cid, box, eps_matrix, sigma_matrix, neighbors
             sig6  = sig^6
             sig12 = sig6^2
 
-            energy += 4 * eps * (sig12/r^12 - sig6/r^6)
-            completeEnergy[counter]=4 * eps * (sig12/r^12 - sig6/r^6)
+            # Shift by V(rc) so the pair energy vanishes continuously at the
+            # cutoff instead of jumping discontinuously. Without this, every
+            # pair crossing r=rc during relaxation introduces a spurious energy
+            # jump of magnitude 4*eps*((sig/rc)^12-(sig/rc)^6), which corrupts
+            # relax()'s energy-based accept/reject comparisons. This shift is
+            # a per-pair constant (depends only on rc and the pair's eps/sig),
+            # so it does not affect forces or the Hessian.
+            sigc6 = (sig/rc)^6
+            sigc12 = sigc6^2
+            shift = 4 * eps * (sigc12 - sigc6)
+
+            energy += 4 * eps * (sig12/r^12 - sig6/r^6) - shift
+            completeEnergy[counter]=4 * eps * (sig12/r^12 - sig6/r^6) - shift
         end
         counter+=1
     end

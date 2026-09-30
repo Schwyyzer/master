@@ -127,6 +127,13 @@ def force(positions, data, neighbors, eps_matrix=epsilon_table, sigma_matrix=sig
     sig6 = sig**6
     sig12 = sig6**2
     pref = 24 * eps * (2 * sig12 / r2**7 - sig6 / r2**4)
+    # neighbors may be a skin-buffered candidate list wider than rc (relax()
+    # rebuilds it with a skin margin to avoid re-querying the tree every
+    # iteration) -- must mask to the actual interaction cutoff here, matching
+    # Version1.1.jl's `if r <= rc && r > 0`, or pairs beyond rc are wrongly
+    # treated as interacting.
+    mask = (r2 <= rc * rc) & (r2 > 0)
+    pref = np.where(mask, pref, 0.0)
     fij = pref[:, None] * dr
     np.add.at(total_force, i, fij)
     np.add.at(total_force, j, -fij)
@@ -147,6 +154,13 @@ def compute_energy(coords, types, box, eps_matrix, sigma_matrix, pairs):
     sig = sigma_matrix[ti, tj]
     inv_r6 = (sig**2 / r2)**3
     energy = 4 * eps * (inv_r6**2 - inv_r6)
+    # Shift by V(rc) so energy vanishes continuously at the cutoff (matches
+    # the shift added to Version1.1.jl's compute_energy), and mask to r<=rc
+    # for the same reason as force() above.
+    inv_rc6 = (sig**2 / (rc * rc))**3
+    shift = 4 * eps * (inv_rc6**2 - inv_rc6)
+    mask = (r2 <= rc * rc) & (r2 > 0)
+    energy = np.where(mask, energy - shift, 0.0)
     return np.sum(energy)
 
 
@@ -226,13 +240,23 @@ def build_hessian_fast(positions, data, neighbour_pairs):
 
     i = neighbour_pairs[:, 0]
     j = neighbour_pairs[:, 1]
-    npairs = len(i)
 
     dr = positions[i] - positions[j]
     dr -= box * np.round(dr / box)
     dx, dy, dz = dr[:, 0], dr[:, 1], dr[:, 2]
     r2 = dx*dx + dy*dy + dz*dz
+
+    # neighbour_pairs may be a skin-buffered candidate list wider than rc
+    # (relax() rebuilds it with a skin margin to avoid re-querying the tree
+    # every iteration), or simply stale after positions have moved -- mask to
+    # the true interaction cutoff here, matching Hessian.jl's
+    # build_hessian_fast (`if r <= rc && r > 0`), or out-of-range pairs
+    # corrupt the Hessian used to find the saddle-search direction.
+    in_range = (r2 <= rc * rc) & (r2 > 0)
+    i, j = i[in_range], j[in_range]
+    dx, dy, dz, r2 = dx[in_range], dy[in_range], dz[in_range], r2[in_range]
     r = np.sqrt(r2)
+    npairs = len(i)
 
     ti = cid[i]
     tj = cid[j]
