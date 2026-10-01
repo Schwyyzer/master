@@ -18,10 +18,22 @@ EPSILON_TABLE, SIGMA_TABLE) default to match this repo's CURRENT
 config.jl -- NOT necessarily what actually produced your CSV, since
 you've been tuning rc locally. This script checks that for you: it
 recomputes the shared starting minimum's energy and compares it against
-KNOWN_CSV_INITIAL_ENERGY (the constant value in your CSV's initial_energy
-column) before doing anything else. A mismatch means fix RC/EPSILON_TABLE/
-SIGMA_TABLE/LAMMPS_PATH first -- nothing below is trustworthy until that
-check passes.
+the initial_energy column read directly from your CSV's own first row
+(every results.csv this repo's run_parallel*.jl scripts produce, old or
+new, carries this column, so there's no constant to hand-update when you
+point this script at a different run) before doing anything else. A
+mismatch means fix RC/EPSILON_TABLE/SIGMA_TABLE/LAMMPS_PATH first --
+nothing below is trustworthy until that check passes.
+
+Works unchanged against results.csv from EITHER run_parallel_no_tracking.jl
+(phase1/phase2) or run_parallel_fortran.jl / art_core_fortran.jl (the
+unified Newton+FIRE algorithm matching art_woconewer.f90): both write dump
+files in the same format (just a different vector in the "ITEM: MOVE"
+section -- the final phase-2 move vs. the final tracked Lanczos
+eigenvector -- which doesn't matter here since the push is always
+rescaled to a target per-atom magnitude regardless of the vector's own
+original scale), and both CSVs carry the seed/success/dump_file/
+final_energy/initial_energy columns this script actually reads.
 
 Push magnitude: rather than one guessed constant, PUSH_MAGNITUDES is a
 list tried smallest-first per saddle, scaled so the SINGLE MOST-
@@ -68,8 +80,6 @@ SIGMA_TABLE = np.array([
     [0.0, 11 / 12, 5 / 6],
 ])
 RELAXATION_STEP_MAGNITUDE = 0.0005
-
-KNOWN_CSV_INITIAL_ENERGY = -13010.936594987796   # from your CSV's initial_energy column
 
 PUSH_MAGNITUDES = [0.01, 0.02, 0.05, 0.1, 0.2, 0.35, 0.5]   # tried smallest-first,
                                                     # per saddle, escalating on non-
@@ -270,6 +280,7 @@ def parse_results_csv(path):
                 "success": row["success"].strip().lower() == "true",
                 "dump_file": row["dump_file"],
                 "final_energy": float(row["final_energy"]),
+                "initial_energy": float(row["initial_energy"]),
             })
     return rows
 
@@ -404,17 +415,30 @@ def main():
     pairs0 = build_neighbor_pairs(positions0, RC, box)
     initial_energy = compute_energy(positions0, data0["cid"], box, pairs0)
 
-    if abs(initial_energy - KNOWN_CSV_INITIAL_ENERGY) > 1e-6:
+    rows = parse_results_csv(RESULTS_CSV)
+    if not rows:
+        raise SystemExit(f"no rows parsed from {RESULTS_CSV}")
+
+    # Sanity check: every row in a given results.csv shares the same starting
+    # minimum, so its initial_energy column is one constant value -- read it
+    # straight from the CSV's own first row instead of a hand-pasted
+    # constant that goes stale the moment this script points at a new run.
+    csv_initial_energy = rows[0]["initial_energy"]
+    if any(abs(r["initial_energy"] - csv_initial_energy) > 1e-6 for r in rows):
+        print("*** WARNING: this CSV's own initial_energy column is not constant across rows --")
+        print("*** it may be the concatenation of more than one run. Treating row 1's value")
+        print(f"*** ({csv_initial_energy}) as the reference; the check below may be meaningless.\n")
+
+    if abs(initial_energy - csv_initial_energy) > 1e-6:
         print(f"*** WARNING: computed initial_energy = {initial_energy}")
-        print(f"*** does NOT match the CSV's recorded initial_energy = {KNOWN_CSV_INITIAL_ENERGY}")
-        print(f"*** (difference = {initial_energy - KNOWN_CSV_INITIAL_ENERGY})")
+        print(f"*** does NOT match the CSV's recorded initial_energy = {csv_initial_energy}")
+        print(f"*** (difference = {initial_energy - csv_initial_energy})")
         print("*** LAMMPS_PATH and/or RC/EPSILON_TABLE/SIGMA_TABLE do NOT match what actually")
         print("*** produced this run -- fix that before trusting anything below.\n")
     else:
         print("initial_energy matches the CSV's recorded value -- LAMMPS_PATH and config")
         print("are at least consistent with the starting point of this run.\n")
 
-    rows = parse_results_csv(RESULTS_CSV)
     successes = [r for r in rows if r["success"]]
     print(f"{len(successes)} successful saddle(s) to validate out of {len(rows)} attempts in the CSV")
     print(f"push magnitudes tried (per side) = {PUSH_MAGNITUDES}, "
