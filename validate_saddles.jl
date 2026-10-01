@@ -53,6 +53,18 @@ caveat as this repo's other scripts) -- if something errors or a
 number looks implausible, paste it back rather than assuming your data
 is bad.
 
+Works unchanged against results.csv from EITHER run_parallel_no_tracking.jl
+(phase1/phase2) or run_parallel_fortran.jl (the unified Newton+FIRE
+algorithm matching art_woconewer.f90): both write dump files via the same
+write_lammps_frame call (so the "ITEM: MOVE" section this script reads is
+in the same format either way -- just a different vector in it, the final
+phase-2 move vs. the final tracked Lanczos eigenvector, which doesn't
+matter here since the push is always rescaled to a target per-atom
+magnitude regardless of the vector's own original scale), and both CSVs
+carry the same seed/success/dump_file/final_energy/initial_energy columns
+this script actually reads. run_parallel_fortran.jl's extra columns
+(converged, is_saddle, degenerate_mode_aborted, ...) are simply ignored.
+
 Run with: julia validate_saddles.jl
 =#
 
@@ -139,7 +151,7 @@ function parse_results_csv(path)
     isempty(lines) && error("empty CSV: $path")
     header = split(lines[1], ",")
     col = Dict(String(name) => i for (i, name) in enumerate(header))
-    for required in ("seed", "success", "dump_file", "final_energy")
+    for required in ("seed", "success", "dump_file", "final_energy", "initial_energy")
         haskey(col, required) || error("CSV missing required column '$required'")
     end
 
@@ -154,6 +166,7 @@ function parse_results_csv(path)
             success = strip(field("success")) == "true",
             dump_file = field("dump_file"),
             final_energy = something(tryparse(Float64, field("final_energy")), NaN),
+            initial_energy = something(tryparse(Float64, field("initial_energy")), NaN),
         ))
     end
     return rows
@@ -180,18 +193,29 @@ positions0 = hcat(data0["x"], data0["y"], data0["z"])
 pairs0 = build_neighbor_pairs(positions0, rc, box)
 initial_energy = compute_energy(positions0, data0["cid"], box, epsilon_table, sigma_table, pairs0)
 
+rows = parse_results_csv(RESULTS_CSV)
+successes = filter(r -> r.success, rows)
+
 # Sanity check: every row in a given results.csv shares the same starting
-# minimum, so its initial_energy column is one constant value -- if what
-# THIS script just computed (from LAMMPS_PATH + the CURRENT config.jl's rc/
-# epsilon_table/sigma_table) doesn't match that constant, this script is
+# minimum, so its initial_energy column is one constant value -- read it
+# straight from the CSV itself (every results.csv this repo's run_parallel*
+# scripts produce, old phase1/phase2 driver or the new Fortran-matching one,
+# carries an initial_energy column) instead of requiring a hand-pasted
+# constant that goes stale the moment you point this script at a different
+# run. If what THIS script just computed (from LAMMPS_PATH + the CURRENT
+# config.jl's rc/epsilon_table/sigma_table) doesn't match it, this script is
 # validating against a different potential than the one that actually
 # produced the CSV, and nothing below is trustworthy until that's fixed.
-# Paste the value from your CSV's initial_energy column here:
-KNOWN_CSV_INITIAL_ENERGY = -13010.936594987796
-if abs(initial_energy - KNOWN_CSV_INITIAL_ENERGY) > 1e-6
+csv_initial_energy = rows[1].initial_energy
+if any(r -> abs(r.initial_energy - csv_initial_energy) > 1e-6, rows)
+    println("*** WARNING: this CSV's own initial_energy column is not constant across rows --")
+    println("*** it may be the concatenation of more than one run. Treating row 1's value")
+    println("*** ($csv_initial_energy) as the reference; the check below may be meaningless.\n")
+end
+if abs(initial_energy - csv_initial_energy) > 1e-6
     println("*** WARNING: computed initial_energy = $initial_energy")
-    println("*** does NOT match the CSV's recorded initial_energy = $KNOWN_CSV_INITIAL_ENERGY")
-    println("*** (difference = $(initial_energy - KNOWN_CSV_INITIAL_ENERGY))")
+    println("*** does NOT match the CSV's recorded initial_energy = $csv_initial_energy")
+    println("*** (difference = $(initial_energy - csv_initial_energy))")
     println("*** LAMMPS_PATH and/or config.jl (rc/epsilon_table/sigma_table) do NOT match")
     println("*** what actually produced this run -- fix that before trusting anything below.\n")
 else
@@ -199,8 +223,6 @@ else
     println("are at least consistent with the starting point of this run.\n")
 end
 
-rows = parse_results_csv(RESULTS_CSV)
-successes = filter(r -> r.success, rows)
 println("$(length(successes)) successful saddle(s) to validate out of $(length(rows)) attempts in the CSV")
 println("push magnitudes tried (per side) = $PUSH_MAGNITUDES, same-configuration RMSD threshold = $RMSD_SAME_THRESHOLD\n")
 
