@@ -1,11 +1,13 @@
 #=
 Run many independent ART attempts in parallel, using art_core_fortran.jl's
-run_art_attempt_fortran -- the algorithm rewritten to match the working
-Fortran reference art_woconewer.f90 (unified FIRE+Newton-step loop,
-warm-started Lanczos mode tracking, no mass-weighting, static neighbor
-list, force-magnitude convergence). See art_core_fortran.jl's header for
-the full list of differences from run_parallel_no_tracking.jl's
-phase1/phase2 design.
+run_art_attempt_fortran -- the algorithm matching the working Fortran
+reference art_woconewer.f90 (unified FIRE+Newton-step loop, warm-started
+Lanczos mode tracking, no mass-weighting, static neighbor list, force-
+magnitude convergence), plus two validated additions from the trust-region
+paper (a second-eigenvalue validity guard, an MEP-proximity diagnostic).
+See art_core_fortran.jl's header for the full list of differences from
+run_parallel_no_tracking.jl's phase1/phase2 design, and for why that
+paper's own step-size scheme was tried and NOT adopted.
 
 Modeled directly on run_parallel_no_tracking.jl; the differences are:
   - includes art_core_fortran.jl instead of art_core_no_tracking.jl
@@ -117,14 +119,15 @@ function run_batch()
     end
 
     successes = FortranAttemptResult[]
-    degenerate_aborts = 0
+    guard_aborts = 0
     n_attempts = 0
     start_time = time()
 
     log_io = open(LOG_PATH, "w")
     println(log_io,
-        "seed,success,kicked_atom,iterations,crit_eigenvalue,converged,is_saddle," *
-        "force_magnitude,initial_energy,final_energy,degenerate_mode_aborted,dump_file,error"
+        "seed,success,kicked_atom,iterations,crit_eigenvalue,second_eigenvalue,converged,is_saddle," *
+        "force_magnitude,mep_proximity,initial_energy,final_energy,degenerate_mode_aborted," *
+        "second_eigenvalue_aborted,dump_file,error"
     )
     flush(log_io)
 
@@ -149,13 +152,14 @@ function run_batch()
                 dump_field = res.dump_file === nothing ? "" : res.dump_file
                 println(log_io,
                     "$(res.seed),$(res.success),$(res.kicked_atom),$(res.iteration),$(res.crit_eigenvalue)," *
-                    "$(res.converged),$(res.is_saddle),$(res.force_magnitude),$(res.initial_energy)," *
-                    "$(res.final_energy),$(res.degenerate_mode_aborted),$dump_field,$err_field"
+                    "$(res.second_eigenvalue),$(res.converged),$(res.is_saddle),$(res.force_magnitude)," *
+                    "$(res.mep_proximity),$(res.initial_energy),$(res.final_energy)," *
+                    "$(res.degenerate_mode_aborted),$(res.second_eigenvalue_aborted),$dump_field,$err_field"
                 )
                 flush(log_io)
 
-                if res.degenerate_mode_aborted
-                    degenerate_aborts += 1
+                if res.degenerate_mode_aborted || res.second_eigenvalue_aborted
+                    guard_aborts += 1
                 end
 
                 if res.success
@@ -171,7 +175,7 @@ function run_batch()
                     if n_attempts % 20 == 0
                         elapsed = round(time() - start_time, digits=1)
                         println("  ...$n_attempts attempts tried so far, $(length(successes)) successes, " *
-                                "$degenerate_aborts degenerate-mode aborts, elapsed=$(elapsed)s")
+                                "$guard_aborts guard aborts (degenerate-mode or second-eigenvalue), elapsed=$(elapsed)s")
                     end
                 end
 
@@ -188,17 +192,18 @@ function run_batch()
     close(log_io)
     rmprocs(workers())
 
-    return successes, degenerate_aborts, n_attempts
+    return successes, guard_aborts, n_attempts
 end
 
-successes, degenerate_aborts, n_attempts = run_batch()
+successes, guard_aborts, n_attempts = run_batch()
 
 # ============================================================
 # Diversity summary
 # ============================================================
-function print_diversity_summary(successes, n_attempts, degenerate_aborts)
+function print_diversity_summary(successes, n_attempts, guard_aborts)
     n = length(successes)
-    println("\n=== Done: $n saddle points found after $n_attempts attempts ($degenerate_aborts degenerate-mode aborts) ===")
+    println("\n=== Done: $n saddle points found after $n_attempts attempts " *
+            "($guard_aborts guard aborts: degenerate-mode or second-eigenvalue) ===")
     println("full per-attempt log: $LOG_PATH")
 
     if n < 2
@@ -259,5 +264,5 @@ function print_barrier_summary(successes)
     @printf("mean barrier = %.6f\n", sum(vals) / n)
 end
 
-print_diversity_summary(successes, n_attempts, degenerate_aborts)
+print_diversity_summary(successes, n_attempts, guard_aborts)
 print_barrier_summary(successes)

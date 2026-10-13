@@ -2,62 +2,59 @@
 art_core_fortran.jl
 
 ART implementation matching the working Fortran reference art_woconewer.f90
-as closely as possible -- a genuine algorithm replacement for the
-phase1/phase2 fixed/adaptive-step design in art_core_no_tracking.jl, not a
-parameter tweak. The differences that actually matter, found by reading
-art_woconewer.f90 line by line against our Julia:
+(kick/neighbor-list/FIRE/Newton-step machinery, unchanged), with two
+validated additions from "Adaptative step magnitude for ART" (hugo, Sept
+2024): a second-eigenvalue validity guard and an MEP-proximity diagnostic.
+See run_art_attempt_fortran's docstring for what those are and how they
+were validated; this header covers what's unchanged from the plain
+Fortran port (see git history for the original, longer rationale against
+art_core_no_tracking.jl's phase1/phase2 design):
 
-  - NO MASS-WEIGHTING ANYWHERE. Fortran declares mass(1)=2.0, mass(2)=1.0
-    in initialize() and never references `mass` again -- not in
-    build_hessian, not in relax_positions, not in calc_energy_forces. Our
-    Hessian/FIRE-equivalent were mass-weighted; this file's driver must
-    set the global `mass` to [1.0, 1.0] before calling build_hessian_fast
-    (see run_parallel_fortran.jl) so the SAME function reduces to a plain,
-    non-mass-weighted Hessian -- no separate Hessian builder needed.
-  - NO initial relaxation before the first Hessian/eigenvector calc: the
-    kicked (unrelaxed) structure goes straight into build_hessian.
-  - Kick: a single atom (uniform over 1:natoms), magnitude 0.15 (not our
-    old first_move_modifier=0.1), direction = normalize(uniform cube
-    sample in [-0.5,0.5]^3) (not Gaussian).
-  - A STATIC neighbor list, built ONCE (skin = rc+1.0, matching Fortran's
-    range_nn = range+1.0) from the starting minimum and reused for the
-    ENTIRE run -- every attempt, every iteration, never rebuilt. This is
-    safe only because force/compute_energy/build_hessian_fast all filter
-    every pair to r<=rc internally regardless of what candidate list they
-    are handed.
+  - NO MASS-WEIGHTING ANYWHERE. The driver sets the global `mass` to
+    [1.0, 1.0] before calling build_hessian_fast (see run_parallel_fortran.jl)
+    so that function reduces to a plain, non-mass-weighted Hessian.
+  - NO initial relaxation before the first Hessian/eigenvector calc.
+  - Kick: a single atom (uniform over 1:natoms), magnitude 0.15, direction
+    = normalize(uniform cube sample in [-0.5,0.5]^3).
+  - A STATIC neighbor list (skin = rc+1.0), built once from the starting
+    minimum and reused for the entire run, relying on
+    force/compute_energy/build_hessian_fast to filter every pair to r<=rc
+    internally regardless of what candidate list they are handed.
   - Lowest-eigenvalue/eigenvector TRACKING via a fixed-length (10-step),
-    warm-started Lanczos run every iteration (calc_lowest_eval), not a
-    from-scratch k-eigenvalue shift-invert solve with "exclude the 3
-    smallest-magnitude values" mode selection. Started from the PREVIOUS
-    iteration's eigenvector, a short Krylov run very efficiently
-    reconverges to the SAME physical mode -- this is what gives Fortran
-    robust mode continuity across iterations without ever confusing a
-    translational/global mode for the one actually being tracked, a
-    failure mode our from-scratch reselection was prone to.
+    warm-started Lanczos run every iteration, not a from-scratch
+    k-eigenvalue reselection.
   - ONE unified loop, not phase1/phase2: FIRE-relax perpendicular to the
     tracked eigenvector, rebuild the Hessian, retrack the mode, then
     either a clamped Newton step (eigenvalue < -eigenvalue_threshold) or
-    a small fixed push (otherwise) -- see run_art_attempt_fortran's
-    docstring for the exact step logic.
+    a small fixed push (otherwise).
   - FIRE relaxation (restricted perpendicular to the tracked eigenvector),
     not adaptive steepest descent -- see relax_positions_fire.
-  - Convergence is FORCE-MAGNITUDE ONLY (max|F| < force_tolerance), not
-    eigenvalue-sign-based.
+  - Convergence is FORCE-MAGNITUDE ONLY (max|F| < force_tolerance).
   - A degenerate-mode abort guard: if |eigenvalue| stays below
     zero_eigenvalue_threshold for more than max_zero_eigenvalue_threshold_number
-    consecutive iterations (likely a translational mode, not a real
-    instability), the attempt is discarded with no result -- matching
-    Fortran's `cycle`.
+    consecutive iterations (likely a translational mode), the attempt is
+    discarded with no result.
 
-One deliberate design choice NOT copied verbatim: Fortran writes an output
-file for every attempt that isn't degenerate-mode-aborted, regardless of
-whether force actually converged below tolerance or the final eigenvalue
-ended up negative (a real saddle) -- it appears to rely on separate,
-external post-processing to filter genuine saddles from the raw dump.
-Here, `success` requires all three: force converged, the final eigenvalue
-is negative (a genuine saddle, not a relaxation back to a minimum), and no
-degenerate-mode abort. `converged` and `is_saddle` are reported separately
-so this choice is visible and reversible.
+NOT adopted from the trust-region paper: its g/alpha step (a single
+combined relaxation+climbing direction with a trust-region-derived step
+size), tried as a wholesale replacement for the FIRE+Newton-step loop
+above. Empirically, on the dense 500-atom test system used to validate
+this file, it failed in two ways depending on configuration: with no
+perpendicular relaxation at all, a raw kick routinely left 2+ unstable
+directions immediately (e.g. one seed: eigenvalue0=-622, eigenvalue1=-552
+right after the kick, before any step), which the method has no mechanism
+to resolve; adding FIRE settling back in fixed that, but then the paper's
+own g-direction -- which scales its climbing component by <h,q0>, the
+current force's alignment with the tracked mode -- was observed to
+collapse toward zero as FIRE relaxation proceeded (the alignment faded
+rather than concentrated), so the climbing drive self-extinguished and
+searches fizzled back toward stability instead of crossing a saddle. The
+old Fortran algorithm never had this failure mode because its
+destabilization push (delta_lm * q0) is unconditional -- fixed magnitude,
+independent of current alignment -- so it keeps making progress regardless.
+See git history on this file for the full trust-region derivation and the
+empirical dead ends, kept there rather than here since they didn't end up
+shaping the algorithm actually used.
 
 This is meant to be included AFTER Version1.1.jl (force / compute_energy /
 perpendicular_forces / config.jl / neighbor_pairs.jl / Hessian.jl /
@@ -76,11 +73,14 @@ Base.@kwdef struct FortranAttemptResult
     initial_energy::Float64
     final_energy::Float64 = NaN
     crit_eigenvalue::Float64 = NaN
+    second_eigenvalue::Float64 = NaN
     force_magnitude::Float64 = NaN
+    mep_proximity::Float64 = NaN
     iteration::Int = 0
     converged::Bool = false
     is_saddle::Bool = false
     degenerate_mode_aborted::Bool = false
+    second_eigenvalue_aborted::Bool = false
     positions::Union{Matrix{Float64},Nothing} = nothing
     dump_file::Union{String,Nothing} = nothing
     error::Union{String,Nothing} = nothing
@@ -93,23 +93,29 @@ flat_to_matrix(v::AbstractVector) = permutedims(reshape(v, 3, :))
 matrix_to_flat(M::AbstractMatrix) = vec(permutedims(M))
 
 """
-    lanczos_lowest_eigenvalue(H, v0; n_iter=10)
+    lanczos_lowest_eigenvalues(H, v0; n_iter=10)
 
 Fixed-length Lanczos tridiagonalization of symmetric `H`, warm-started from
 `v0` (need not be unit norm), matching art_woconewer.f90's calc_lowest_eval
 when eval_tolerance<0 (always runs exactly `n_iter` steps -- no
 early-convergence check; ql_start_size = ql_max_iteration = 10 in the
-reference). Returns `(lowest_eval, evec)`: the most negative Ritz value
-found among the `n_iter` Ritz values of the resulting tridiagonal matrix,
-and its corresponding unit eigenvector reconstructed from the Lanczos
-basis -- NOT necessarily H's true global minimum eigenvalue, but whichever
-the Krylov subspace built from `v0` captures. That's the point: started
-from a good previous estimate, this reconverges to the SAME physical mode
-almost every iteration, which is what gives Fortran's continuous, robust
-mode identity that a from-scratch "recompute k eigenvalues, exclude the 3
-smallest by magnitude" reselection lacks.
+reference). Returns `(lowest_eval, second_eval, evec)`: the two most
+negative Ritz values found among the `n_iter` Ritz values of the resulting
+tridiagonal matrix, and the unit eigenvector corresponding to the lowest,
+reconstructed from the Lanczos basis.
+
+Neither is necessarily H's true global minimum/second eigenvalue, but
+whichever the Krylov subspace built from `v0` captures -- that's the point
+for the lowest one: started from a good previous estimate, this
+reconverges to the SAME physical mode almost every iteration, giving
+robust mode continuity that a from-scratch reselection lacks. For the
+second value, this relies on the trust-region paper's own empirical claim
+that a small, non-expanded Krylov run already approximates it well enough
+to use as a validity check (see run_art_attempt_fortran) -- not
+independently verified here beyond confirming it doesn't cause regressions
+(see that function's docstring for how it was validated).
 """
-function lanczos_lowest_eigenvalue(H, v0::Vector{Float64}; n_iter::Int=10)
+function lanczos_lowest_eigenvalues(H, v0::Vector{Float64}; n_iter::Int=10)
     n = length(v0)
     Q = zeros(Float64, n, n_iter)
     alpha = zeros(Float64, n_iter)
@@ -140,14 +146,15 @@ function lanczos_lowest_eigenvalue(H, v0::Vector{Float64}; n_iter::Int=10)
 
     T = SymTridiagonal(alpha, beta[1:end-1])
     decomp = eigen(T)
-    idx = argmin(decomp.values)
-    lowest_eval = decomp.values[idx]
-    z = decomp.vectors[:, idx]
+    order = sortperm(decomp.values)
+    lowest_eval = decomp.values[order[1]]
+    second_eval = decomp.values[order[2]]
+    z = decomp.vectors[:, order[1]]
 
     evec = Q * z
     evec ./= norm(evec)
 
-    return lowest_eval, evec
+    return lowest_eval, second_eval, evec
 end
 
 """
@@ -161,7 +168,7 @@ delta_t^2/(2*1.0365e-28) uniformly), forces kept perpendicular to
 vector) throughout, and FIRE's adaptive-timestep/mixing schedule. All FIRE
 state (velocity, timestep, alpha) is local to this call, matching
 Fortran's locals in `relax_positions` -- nothing persists between calls.
-Returns `(positions, energy, forces)` after `n_iterations` steps.
+Returns the relaxed `positions` after `n_iterations` steps.
 """
 function relax_positions_fire(positions, data, neighbors, restriction_vector, n_iterations, box)
     natoms = size(positions, 1)
@@ -180,7 +187,6 @@ function relax_positions_fire(positions, data, neighbors, restriction_vector, n_
     velocities = zeros(natoms, 3)
     forces = force(positions, data, neighbors)
     forces = perpendicular_forces(forces, restriction_vector)
-    energy = compute_energy(positions, data["cid"], box, epsilon_table, sigma_table, neighbors)
 
     for _ in 1:n_iterations
         h_parameter = delta_t^2 / (2.0 * mass_const)
@@ -189,7 +195,6 @@ function relax_positions_fire(positions, data, neighbors, restriction_vector, n_
         last_forces = forces
         forces = force(positions, data, neighbors)
         forces = perpendicular_forces(forces, restriction_vector)
-        energy = compute_energy(positions, data["cid"], box, epsilon_table, sigma_table, neighbors)
 
         velocities = velocities .+ (last_forces .+ forces) .* (h_parameter / delta_t)
 
@@ -211,30 +216,64 @@ function relax_positions_fire(positions, data, neighbors, restriction_vector, n_
         end
     end
 
-    return positions, energy, forces
+    return positions
 end
 
 """
     run_art_attempt_fortran(seed, positions0, data, pairs_static, box; kwargs...)
 
-One full ART attempt matching art_woconewer.f90's unified search loop --
-see this file's header for the full list of differences from
-art_core_no_tracking.jl's phase1/phase2 design. `pairs_static` must be a
-STATIC neighbor list built once (skin = rc+1.0) from the starting minimum
-and shared across every attempt (see run_parallel_fortran.jl); it is never
-rebuilt here, matching the reference exactly.
+One full ART attempt matching art_woconewer.f90's unified FIRE+Newton-step
+search loop exactly, plus two additions from "Adaptative step magnitude
+for ART" (hugo, Sept 2024):
 
-Default keyword values are the reference's own constants verbatim:
-eigenvalue_threshold=3.0, delta_x_max=0.125, delta_lm=0.025,
-force_tolerance=1e-3, zero_eigenvalue_threshold=0.1,
+  - A second-eigenvalue validity guard (that paper's section 1.1): if the
+    Lanczos run's SECOND-lowest Ritz value stays negative for more than
+    `max_consecutive_second_eig_negative` CONSECUTIVE iterations, the
+    attempt is discarded (2+ sustained unstable directions mean the
+    eventual saddle may not be adjacent to the starting minimum). The
+    paper's own description aborts on the FIRST negative reading; that was
+    tried and tested against a known-good seed (one that reaches a
+    genuine, adjacent saddle under the plain Fortran algorithm) and wrongly
+    rejected it over a transient dip -- this FIRE-based search evidently
+    passes through brief, recoverable multi-instability excursions that a
+    literal instant-abort doesn't tolerate. Requiring several consecutive
+    negative readings (mirroring how the pre-existing zero-eigenvalue guard
+    already requires `max_zero_eigenvalue_threshold_number` consecutive
+    iterations, not one) was validated to reproduce the plain algorithm's
+    behavior exactly, seed for seed, iteration count for iteration count,
+    final eigenvalue for final eigenvalue, across a 22-seed batch on the
+    dense 500-atom test system (6/22 successes either way, identical
+    per-seed outcomes) -- i.e. this guard no longer changes behavior at
+    all on that sample; it's a dormant safety net for cases genuinely
+    worth discarding, not validated to ever have actually fired correctly
+    yet.
+  - mep_proximity = <q0,h>/|h| is tracked (its running minimum returned,
+    not enforced) -- the paper monitors this as a diagnostic, staying
+    close to 1 if the search is following a minimum energy path, without
+    prescribing a hard cutoff.
+
+The paper's OWN step-size/direction scheme (a single trust-region-sized
+step along g = h - (1+gamma)<h,q0>q0, replacing FIRE and the
+destabilization/Newton split entirely) was tried and NOT adopted -- see
+this file's header comment for why it failed on this system, and git
+history for the fuller derivation.
+
+`pairs_static` must be a STATIC neighbor list built once (skin = rc+1.0)
+from the starting minimum and shared across every attempt (see
+run_parallel_fortran.jl); it is never rebuilt here.
+
+Keyword defaults: eigenvalue_threshold=3.0, delta_x_max=0.125,
+delta_lm=0.025, force_tolerance=1e-3, zero_eigenvalue_threshold=0.1,
 max_zero_eigenvalue_threshold_number=10, kick_magnitude=0.15,
-starting_fire_iterations=5, lanczos_iterations=10, max_iterations=200.
+starting_fire_iterations=5, lanczos_iterations=10, max_iterations=200 are
+the reference's own constants verbatim, unchanged from the plain Fortran
+port. max_consecutive_second_eig_negative=5 is new and unvalidated beyond
+"doesn't regress the known-good sample" -- there's no reference value for
+it since the paper's own description (abort on the first negative reading)
+is what the validation showed to be too strict here.
 
 `success` requires force convergence AND a genuinely negative final
-eigenvalue AND no degenerate-mode abort -- see the "one deliberate design
-choice not copied verbatim" note in this file's header for why that's
-stricter than the reference's own unconditional (except degenerate-mode)
-output-writing.
+eigenvalue AND no abort (degenerate-mode or second-eigenvalue).
 """
 function run_art_attempt_fortran(
     seed::Int,
@@ -250,6 +289,7 @@ function run_art_attempt_fortran(
     force_tolerance::Float64 = 1e-3,
     zero_eigenvalue_threshold::Float64 = 0.1,
     max_zero_eigenvalue_threshold_number::Int = 10,
+    max_consecutive_second_eig_negative::Int = 5,
     kick_magnitude::Float64 = 0.15,
     starting_fire_iterations::Int = 5,
     lanczos_iterations::Int = 10,
@@ -274,27 +314,32 @@ function run_art_attempt_fortran(
         positions = positions0 .+ kick_magnitude .* flat_to_matrix(evec)
 
         H = build_hessian_fast(positions, data, pairs_static)
-        lowest_eval, evec = lanczos_lowest_eigenvalue(H, evec; n_iter=lanczos_iterations)
+        lowest_eval, second_eval, evec = lanczos_lowest_eigenvalues(H, evec; n_iter=lanczos_iterations)
 
         n_fire = starting_fire_iterations
         zero_eig_count = 0
+        second_eig_neg_count = 0
         converged = false
-        current_forces = zeros(natoms, 3)
-        energy = initial_energy
-        force_mag = Inf
+        force_mag = Inf   # must predate the loop: read in the final return after it ends
+        mep_proximity_min = Inf
 
         while !converged
             iteration += 1
 
-            positions, _, _ = relax_positions_fire(positions, data, pairs_static, flat_to_matrix(evec), n_fire, box)
+            positions = relax_positions_fire(positions, data, pairs_static, flat_to_matrix(evec), n_fire, box)
 
             H = build_hessian_fast(positions, data, pairs_static)
-            lowest_eval, evec = lanczos_lowest_eigenvalue(H, evec; n_iter=lanczos_iterations)
+            lowest_eval, second_eval, evec = lanczos_lowest_eigenvalues(H, evec; n_iter=lanczos_iterations)
 
             current_forces = force(positions, data, pairs_static)
-            energy = compute_energy(positions, data["cid"], box, epsilon_table, sigma_table, pairs_static)
+            h_flat = matrix_to_flat(current_forces)
+            h_norm = norm(h_flat)
 
-            if dot(matrix_to_flat(current_forces), evec) > 0.0
+            h_dot_q0 = dot(h_flat, evec)
+            mep_proximity = h_norm > 0 ? abs(h_dot_q0) / h_norm : 1.0
+            mep_proximity_min = min(mep_proximity_min, mep_proximity)
+
+            if h_dot_q0 > 0.0
                 evec = -evec
             end
 
@@ -303,9 +348,11 @@ function run_art_attempt_fortran(
             if abs(lowest_eval) < zero_eigenvalue_threshold
                 zero_eig_count += 1
                 if zero_eig_count > max_zero_eigenvalue_threshold_number
+                    energy = compute_energy(positions, data["cid"], box, epsilon_table, sigma_table, pairs_static)
                     return FortranAttemptResult(;
                         success=false, seed, kicked_atom, kick_dir, initial_energy,
-                        final_energy=energy, crit_eigenvalue=lowest_eval, force_magnitude=force_mag,
+                        final_energy=energy, crit_eigenvalue=lowest_eval, second_eigenvalue=second_eval,
+                        force_magnitude=force_mag, mep_proximity=mep_proximity_min,
                         iteration, degenerate_mode_aborted=true,
                         error="possible translational mode, aborted (|eigenvalue|<$(zero_eigenvalue_threshold) " *
                               "for >$(max_zero_eigenvalue_threshold_number) consecutive iterations)",
@@ -315,9 +362,27 @@ function run_art_attempt_fortran(
                 zero_eig_count = 0
             end
 
+            if second_eval < 0
+                second_eig_neg_count += 1
+                if second_eig_neg_count > max_consecutive_second_eig_negative
+                    energy = compute_energy(positions, data["cid"], box, epsilon_table, sigma_table, pairs_static)
+                    return FortranAttemptResult(;
+                        success=false, seed, kicked_atom, kick_dir, initial_energy,
+                        final_energy=energy, crit_eigenvalue=lowest_eval, second_eigenvalue=second_eval,
+                        force_magnitude=force_mag, mep_proximity=mep_proximity_min,
+                        iteration, second_eigenvalue_aborted=true,
+                        error="second-lowest eigenvalue stayed negative for >$(max_consecutive_second_eig_negative) " *
+                              "consecutive iterations (currently $(second_eval)) -- sustained 2+ unstable " *
+                              "directions, the eventual saddle may not be adjacent to the starting minimum",
+                    )
+                end
+            else
+                second_eig_neg_count = 0
+            end
+
             evec_matrix = flat_to_matrix(evec)
             if lowest_eval < -eigenvalue_threshold
-                delta_x = dot(matrix_to_flat(current_forces), evec) / lowest_eval
+                delta_x = dot(h_flat, evec) / lowest_eval
                 # matches the reference literally: clamps the MAGNITUDE to
                 # delta_x_max without preserving delta_x's sign. Harmless in
                 # practice -- the sign-alignment above guarantees
@@ -342,6 +407,7 @@ function run_art_attempt_fortran(
             end
         end
 
+        energy = compute_energy(positions, data["cid"], box, epsilon_table, sigma_table, pairs_static)
         is_saddle = lowest_eval < 0
         success = converged && is_saddle
 
@@ -355,7 +421,8 @@ function run_art_attempt_fortran(
 
         return FortranAttemptResult(;
             success, seed, kicked_atom, kick_dir, initial_energy,
-            final_energy=energy, crit_eigenvalue=lowest_eval, force_magnitude=force_mag,
+            final_energy=energy, crit_eigenvalue=lowest_eval, second_eigenvalue=second_eval,
+            force_magnitude=force_mag, mep_proximity=mep_proximity_min,
             iteration, converged, is_saddle,
             positions = success ? positions : nothing,
             dump_file = success ? dump_file : nothing,
