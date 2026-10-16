@@ -20,6 +20,44 @@ function create_dump_file()
     return filename, filename2
 end
 
+#=
+SimData replaces the Dict{String,Any} this used to return. A Dict with
+Any-typed values forces every function that reads from it (force,
+compute_energy, build_hessian_fast -- the hottest loops in the whole
+program) into dynamically-typed, boxed lookups: `data["lx"]` has no
+compile-time type, so neither does anything computed from it, and Julia
+can't specialize/inline that code at all. A concretely-typed struct fixes
+this for any code that accesses fields with `.` -- which the hot functions
+below have been switched to.
+
+Every OTHER file in this codebase still says `data["lx"]`, `data["cid"]`,
+or (in a couple of test scripts) `data["x"] = ...` -- the getindex/
+setindex! methods below make that keep working unchanged, so none of those
+call sites needed to change. They're just slower than `.lx` because the
+field is looked up by a runtime string each call; fine for the places that
+still do it, since none of them are in a per-pair or per-iteration loop.
+=#
+# Guarded so this file can be `include`d more than once in the same Julia
+# session (e.g. re-running a test script interactively) without hitting
+# "invalid redefinition of constant SimData" -- Julia disallows redefining
+# a struct type in-place, unlike a plain variable or a method.
+if !isdefined(@__MODULE__, :SimData)
+    mutable struct SimData
+        natoms::Int
+        id::Vector{Int}
+        cid::Vector{Int}
+        x::Vector{Float64}
+        y::Vector{Float64}
+        z::Vector{Float64}
+        lx::Float64
+        ly::Float64
+        lz::Float64
+    end
+end
+
+Base.getindex(d::SimData, k::AbstractString) = getproperty(d, Symbol(k))
+Base.setindex!(d::SimData, v, k::AbstractString) = setproperty!(d, Symbol(k), v)
+
 function parse_lammps_data(path)
 
     lines = [strip(line) for line in readlines(path)]
@@ -108,17 +146,7 @@ function parse_lammps_data(path)
         z_arr[i] = parse(Float64, parts[5])
     end
 
-    return Dict(
-        "natoms" => natoms,
-        "id" => id_arr,
-        "cid" => cid_arr,
-        "x" => x_arr,
-        "y" => y_arr,
-        "z" => z_arr,
-        "lx" => lx,
-        "ly" => ly,
-        "lz" => lz,
-    )
+    return SimData(natoms, id_arr, cid_arr, x_arr, y_arr, z_arr, lx, ly, lz)
 end
 
 

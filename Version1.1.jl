@@ -44,6 +44,26 @@ function perpendicular_forces(forces, moves)
     return reshape(perp_vector, 3, :)'
 end
 
+"""
+    perpendicular_forces!(forces, moves)
+
+In-place version of `perpendicular_forces`: projects `moves`'s component
+out of `forces` by mutating `forces` directly, instead of allocating the
+transposed/flattened/reshaped copies `perpendicular_forces` does. `dot` and
+broadcasting on an AbstractArray already work elementwise regardless of
+shape, so `dot(forces, moves)` on the natoms x 3 matrices gives exactly the
+same scalar as `perpendicular_forces`'s flatten-first version -- no
+transpose/vec/reshape needed. Matches `perpendicular_forces`'s own
+(unconditional) division; `moves` is always a normalized Lanczos
+eigenvector in this codebase's call sites, so it is never the zero vector.
+"""
+function perpendicular_forces!(forces, moves)
+    denom = dot(moves, moves)
+    coeff = dot(forces, moves) / denom
+    @. forces -= coeff * moves
+    return forces
+end
+
 
 
 function force(positions, data, neighbors;
@@ -52,12 +72,34 @@ function force(positions, data, neighbors;
 
     N = size(positions,1)
     F = zeros(N,3)
+    force!(F, positions, data, neighbors; eps_matrix, sigma_matrix)
+    return F
+end
 
-    lx = data["lx"]
-    ly = data["ly"]
-    lz = data["lz"]
+"""
+    force!(F, positions, data, neighbors; eps_matrix=epsilon_table, sigma_matrix=sigma_table)
 
-    cid = data["cid"]
+In-place version of `force`: accumulates into a caller-owned `F` (zeroed
+first) instead of allocating a fresh array every call. Use this in any
+loop that calls `force`/`force!` many times per attempt (FIRE relaxation,
+the outer ART iteration) -- a fresh `zeros(N,3)` on every one of those
+calls is a lot of avoidable GC pressure at the call counts this runs at.
+"""
+function force!(F, positions, data, neighbors;
+                 eps_matrix=epsilon_table,
+                 sigma_matrix=sigma_table)
+
+    fill!(F, 0.0)
+
+    # `data.lx`/`data.cid` (field access) rather than `data["lx"]` (string-
+    # keyed lookup): now that `data` is a concretely-typed SimData struct,
+    # this is what actually makes this loop type-stable -- see SimData's
+    # docstring in lammps_and_document.jl.
+    lx = data.lx
+    ly = data.ly
+    lz = data.lz
+
+    cid = data.cid
 
     @inbounds for p in axes(neighbors,1)
 
@@ -98,8 +140,6 @@ end
 
 function compute_energy(positions, cid, box, eps_matrix, sigma_matrix, neighbors)
     energy = 0.0
-    counter=1
-    completeEnergy=zeros(size(neighbors,1))
 
     @inbounds for p in axes(neighbors,1)
 
@@ -139,13 +179,9 @@ function compute_energy(positions, cid, box, eps_matrix, sigma_matrix, neighbors
             shift = 4 * eps * (sigc12 - sigc6)
 
             energy += 4 * eps * (sig12/r^12 - sig6/r^6) - shift
-            completeEnergy[counter]=4 * eps * (sig12/r^12 - sig6/r^6) - shift
         end
-        counter+=1
     end
 
-    #writedlm("//home//schwyyzer//Desktop//Master Thesis//neighbors.txt",neighbors)
-    #writedlm("//home//schwyyzer//Desktop//Master Thesis//completeEnergy.txt",completeEnergy)
     return energy
 end
 

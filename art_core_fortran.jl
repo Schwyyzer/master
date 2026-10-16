@@ -184,23 +184,38 @@ function relax_positions_fire(positions, data, neighbors, restriction_vector, n_
     mass_const = 1.0365e-28
     nsteps_since_p_neg = 0
 
+    # Preallocated once per call and reused for every one of the
+    # n_iterations substeps below (via force!/perpendicular_forces!)
+    # instead of each substep allocating its own fresh arrays -- this
+    # loop is the hottest one in the whole program (n_iterations grows
+    # over the course of an attempt, and this runs every outer ART
+    # iteration), so a fresh zeros(natoms,3)/positions-copy on every
+    # substep was a lot of avoidable GC pressure.
     velocities = zeros(natoms, 3)
-    forces = force(positions, data, neighbors)
-    forces = perpendicular_forces(forces, restriction_vector)
+    forces = zeros(natoms, 3)
+    last_forces = zeros(natoms, 3)
 
+    force!(forces, positions, data, neighbors)
+    perpendicular_forces!(forces, restriction_vector)
+
+    # `positions` is mutated in place from here on (see below) -- safe
+    # because this function's one call site (run_art_attempt_fortran)
+    # always passes a freshly-allocated array that nothing else holds a
+    # reference to, and immediately rebinds its own `positions` to this
+    # function's return value anyway.
     for _ in 1:n_iterations
         h_parameter = delta_t^2 / (2.0 * mass_const)
 
-        positions = positions .+ velocities .* delta_t .+ forces .* h_parameter
-        last_forces = forces
-        forces = force(positions, data, neighbors)
-        forces = perpendicular_forces(forces, restriction_vector)
+        @. positions += velocities * delta_t + forces * h_parameter
+        last_forces .= forces
+        force!(forces, positions, data, neighbors)
+        perpendicular_forces!(forces, restriction_vector)
 
-        velocities = velocities .+ (last_forces .+ forces) .* (h_parameter / delta_t)
+        @. velocities += (last_forces + forces) * (h_parameter / delta_t)
 
-        p = dot(matrix_to_flat(forces), matrix_to_flat(velocities))
+        p = dot(forces, velocities)
         v_norm = norm(velocities)
-        velocities = (1.0 - alpha) .* velocities .+ alpha .* forces .* v_norm
+        @. velocities = (1.0 - alpha) * velocities + alpha * forces * v_norm
 
         if p > 0
             nsteps_since_p_neg += 1
@@ -322,6 +337,7 @@ function run_art_attempt_fortran(
         converged = false
         force_mag = Inf   # must predate the loop: read in the final return after it ends
         mep_proximity_min = Inf
+        current_forces = zeros(natoms, 3)   # reused every iteration via force!
 
         while !converged
             iteration += 1
@@ -331,7 +347,7 @@ function run_art_attempt_fortran(
             H = build_hessian_fast(positions, data, pairs_static)
             lowest_eval, second_eval, evec = lanczos_lowest_eigenvalues(H, evec; n_iter=lanczos_iterations)
 
-            current_forces = force(positions, data, pairs_static)
+            force!(current_forces, positions, data, pairs_static)
             h_flat = matrix_to_flat(current_forces)
             h_norm = norm(h_flat)
 

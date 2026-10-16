@@ -41,6 +41,32 @@ TARGET_SUCCESSES = 50
 N_WORKERS = max(1, Sys.CPU_THREADS - 1)   # leave a core free for the OS/master
 MAX_ITERATIONS = 200                      # matches art_woconewer.f90's max_number_of_art_iterations
 
+# When true: no per-attempt CSV log (and no flush() after every attempt --
+# a real cost over thousands of failed attempts), no per-success dump
+# files, no progress printlns, no diversity/RMSD report. Instead, at the
+# very end of the run, print ONLY the config variables that were actually
+# used, the starting position, and the saddle point positions found --
+# nothing else. Use this when you just want the result, not the
+# documentation of how the run got there.
+MINIMAL_OUTPUT = false
+
+# run_art_attempt_fortran's own keyword defaults (art_core_fortran.jl),
+# duplicated here as named settings -- rather than left implicit -- so
+# that (a) MINIMAL_OUTPUT's end-of-run summary has something concrete to
+# print as "the config variables that were used", and (b) they can be
+# tuned from this one place without touching art_core_fortran.jl. Values
+# unchanged from those defaults, so behavior is identical either way.
+EIGENVALUE_THRESHOLD = 3.0
+DELTA_X_MAX = 0.125
+DELTA_LM = 0.025
+FORCE_TOLERANCE = 1e-3
+ZERO_EIGENVALUE_THRESHOLD = 0.1
+MAX_ZERO_EIGENVALUE_THRESHOLD_NUMBER = 10
+MAX_CONSECUTIVE_SECOND_EIG_NEGATIVE = 5
+KICK_MAGNITUDE = 0.15
+STARTING_FIRE_ITERATIONS = 5
+LANCZOS_ITERATIONS = 10
+
 OUTPUT_DIR = "//home//schwyyzer//Desktop//Master Thesis//parallel_art_fortran_run_$(Dates.format(now(), "yyyymmdd_HHMMSS"))"
 DUMP_DIR = joinpath(OUTPUT_DIR, "dumps")
 LOG_PATH = joinpath(OUTPUT_DIR, "results.csv")
@@ -72,6 +98,17 @@ end
 
 @everywhere lammps_path = $LAMMPS_PATH
 @everywhere max_iterations = $MAX_ITERATIONS
+@everywhere minimal_output = $MINIMAL_OUTPUT
+@everywhere eigenvalue_threshold = $EIGENVALUE_THRESHOLD
+@everywhere delta_x_max = $DELTA_X_MAX
+@everywhere delta_lm = $DELTA_LM
+@everywhere force_tolerance = $FORCE_TOLERANCE
+@everywhere zero_eigenvalue_threshold = $ZERO_EIGENVALUE_THRESHOLD
+@everywhere max_zero_eigenvalue_threshold_number = $MAX_ZERO_EIGENVALUE_THRESHOLD_NUMBER
+@everywhere max_consecutive_second_eig_negative = $MAX_CONSECUTIVE_SECOND_EIG_NEGATIVE
+@everywhere kick_magnitude = $KICK_MAGNITUDE
+@everywhere starting_fire_iterations = $STARTING_FIRE_ITERATIONS
+@everywhere lanczos_iterations = $LANCZOS_ITERATIONS
 @everywhere begin
     data = parse_lammps_data(lammps_path)
     positions0 = hcat(data["x"], data["y"], data["z"])
@@ -89,15 +126,27 @@ end
     function attempt_wrapper(seed::Int, dump_path::String)
         run_art_attempt_fortran(
             seed, positions0, data, pairs_static, box;
-            dump_file = dump_path,
+            dump_file = minimal_output ? nothing : dump_path,
             max_iterations = max_iterations,
+            eigenvalue_threshold = eigenvalue_threshold,
+            delta_x_max = delta_x_max,
+            delta_lm = delta_lm,
+            force_tolerance = force_tolerance,
+            zero_eigenvalue_threshold = zero_eigenvalue_threshold,
+            max_zero_eigenvalue_threshold_number = max_zero_eigenvalue_threshold_number,
+            max_consecutive_second_eig_negative = max_consecutive_second_eig_negative,
+            kick_magnitude = kick_magnitude,
+            starting_fire_iterations = starting_fire_iterations,
+            lanczos_iterations = lanczos_iterations,
         )
     end
 end
 
-println("natoms = $(data["natoms"]), box = $box, npairs(static skin list, rc=$rc) = $(size(pairs_static,1))")
-println("mass (overridden for this driver) = $mass")
-println("workers = $(workers())  (each pinned to 1 thread; BLAS pinned to 1 thread)")
+if !MINIMAL_OUTPUT
+    println("natoms = $(data["natoms"]), box = $box, npairs(static skin list, rc=$rc) = $(size(pairs_static,1))")
+    println("mass (overridden for this driver) = $mass")
+    println("workers = $(workers())  (each pinned to 1 thread; BLAS pinned to 1 thread)")
+end
 
 # ============================================================
 # Dispatch loop: keep every worker busy until TARGET_SUCCESSES
@@ -123,13 +172,15 @@ function run_batch()
     n_attempts = 0
     start_time = time()
 
-    log_io = open(LOG_PATH, "w")
-    println(log_io,
-        "seed,success,kicked_atom,iterations,crit_eigenvalue,second_eigenvalue,converged,is_saddle," *
-        "force_magnitude,mep_proximity,initial_energy,final_energy,degenerate_mode_aborted," *
-        "second_eigenvalue_aborted,dump_file,error"
-    )
-    flush(log_io)
+    log_io = MINIMAL_OUTPUT ? nothing : open(LOG_PATH, "w")
+    if !MINIMAL_OUTPUT
+        println(log_io,
+            "seed,success,kicked_atom,iterations,crit_eigenvalue,second_eigenvalue,converged,is_saddle," *
+            "force_magnitude,mep_proximity,initial_energy,final_energy,degenerate_mode_aborted," *
+            "second_eigenvalue_aborted,dump_file,error"
+        )
+        flush(log_io)
+    end
 
     live_workers = Set(workers())
 
@@ -148,15 +199,17 @@ function run_batch()
                 end
                 n_attempts += 1
 
-                err_field = res.error === nothing ? "" : replace(res.error, "\n" => " | ", "," => ";")
-                dump_field = res.dump_file === nothing ? "" : res.dump_file
-                println(log_io,
-                    "$(res.seed),$(res.success),$(res.kicked_atom),$(res.iteration),$(res.crit_eigenvalue)," *
-                    "$(res.second_eigenvalue),$(res.converged),$(res.is_saddle),$(res.force_magnitude)," *
-                    "$(res.mep_proximity),$(res.initial_energy),$(res.final_energy)," *
-                    "$(res.degenerate_mode_aborted),$(res.second_eigenvalue_aborted),$dump_field,$err_field"
-                )
-                flush(log_io)
+                if !MINIMAL_OUTPUT
+                    err_field = res.error === nothing ? "" : replace(res.error, "\n" => " | ", "," => ";")
+                    dump_field = res.dump_file === nothing ? "" : res.dump_file
+                    println(log_io,
+                        "$(res.seed),$(res.success),$(res.kicked_atom),$(res.iteration),$(res.crit_eigenvalue)," *
+                        "$(res.second_eigenvalue),$(res.converged),$(res.is_saddle),$(res.force_magnitude)," *
+                        "$(res.mep_proximity),$(res.initial_energy),$(res.final_energy)," *
+                        "$(res.degenerate_mode_aborted),$(res.second_eigenvalue_aborted),$dump_field,$err_field"
+                    )
+                    flush(log_io)
+                end
 
                 if res.degenerate_mode_aborted || res.second_eigenvalue_aborted
                     guard_aborts += 1
@@ -164,15 +217,17 @@ function run_batch()
 
                 if res.success
                     push!(successes, res)
-                    elapsed = round(time() - start_time, digits=1)
-                    @printf(
-                        "[%2d/%2d] SUCCESS  seed=%-6d atom=%-5d E=%.6f  iters=%-4d  eig=%.5f  elapsed=%.1fs  attempts_so_far=%d\n",
-                        length(successes), TARGET_SUCCESSES, res.seed, res.kicked_atom,
-                        res.final_energy, res.iteration, res.crit_eigenvalue,
-                        elapsed, n_attempts
-                    )
+                    if !MINIMAL_OUTPUT
+                        elapsed = round(time() - start_time, digits=1)
+                        @printf(
+                            "[%2d/%2d] SUCCESS  seed=%-6d atom=%-5d E=%.6f  iters=%-4d  eig=%.5f  elapsed=%.1fs  attempts_so_far=%d\n",
+                            length(successes), TARGET_SUCCESSES, res.seed, res.kicked_atom,
+                            res.final_energy, res.iteration, res.crit_eigenvalue,
+                            elapsed, n_attempts
+                        )
+                    end
                 else
-                    if n_attempts % 20 == 0
+                    if !MINIMAL_OUTPUT && n_attempts % 20 == 0
                         elapsed = round(time() - start_time, digits=1)
                         println("  ...$n_attempts attempts tried so far, $(length(successes)) successes, " *
                                 "$guard_aborts guard aborts (degenerate-mode or second-eigenvalue), elapsed=$(elapsed)s")
@@ -189,7 +244,9 @@ function run_batch()
         sleep(0.05)
     end
 
-    close(log_io)
+    if !MINIMAL_OUTPUT
+        close(log_io)
+    end
     rmprocs(workers())
 
     return successes, guard_aborts, n_attempts
@@ -264,5 +321,45 @@ function print_barrier_summary(successes)
     @printf("mean barrier = %.6f\n", sum(vals) / n)
 end
 
-print_diversity_summary(successes, n_attempts, guard_aborts)
-print_barrier_summary(successes)
+# ============================================================
+# Minimal summary (MINIMAL_OUTPUT=true): config + starting position +
+# saddle positions, nothing else -- no CSV, no dump files, no RMSD report.
+# ============================================================
+function print_positions(positions)
+    for i in axes(positions, 1)
+        @printf("%6d  %.12f  %.12f  %.12f\n", i, positions[i,1], positions[i,2], positions[i,3])
+    end
+end
+
+function print_minimal_summary(successes, positions0)
+    println("=== config ===")
+    println("rc = $rc")
+    println("mass = $mass")
+    println("eigenvalue_threshold = $EIGENVALUE_THRESHOLD")
+    println("delta_x_max = $DELTA_X_MAX")
+    println("delta_lm = $DELTA_LM")
+    println("force_tolerance = $FORCE_TOLERANCE")
+    println("zero_eigenvalue_threshold = $ZERO_EIGENVALUE_THRESHOLD")
+    println("max_zero_eigenvalue_threshold_number = $MAX_ZERO_EIGENVALUE_THRESHOLD_NUMBER")
+    println("max_consecutive_second_eig_negative = $MAX_CONSECUTIVE_SECOND_EIG_NEGATIVE")
+    println("kick_magnitude = $KICK_MAGNITUDE")
+    println("starting_fire_iterations = $STARTING_FIRE_ITERATIONS")
+    println("lanczos_iterations = $LANCZOS_ITERATIONS")
+    println("max_iterations = $MAX_ITERATIONS")
+
+    println("\n=== starting position ($(size(positions0,1)) atoms) ===")
+    print_positions(positions0)
+
+    println("\n=== saddle point positions ($(length(successes)) found) ===")
+    for s in successes
+        println("\n--- seed=$(s.seed)  final_energy=$(s.final_energy)  crit_eigenvalue=$(s.crit_eigenvalue) ---")
+        print_positions(s.positions)
+    end
+end
+
+if MINIMAL_OUTPUT
+    print_minimal_summary(successes, positions0)
+else
+    print_diversity_summary(successes, n_attempts, guard_aborts)
+    print_barrier_summary(successes)
+end

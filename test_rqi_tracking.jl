@@ -49,6 +49,7 @@ Run with: julia test_rqi_tracking.jl
 =#
 
 include("config.jl")
+include("lammps_and_document.jl")   # defines SimData, used below
 include("neighbor_pairs.jl")
 include("Hessian.jl")
 include("rqi_tracking.jl")
@@ -86,10 +87,10 @@ function make_synthetic_system(N::Int, box::NTuple{3,Float64}; seed::Int=1, min_
         end
     end
     cid = rand(rng, 1:2, N)
-    data = Dict(
-        "natoms" => N, "id" => collect(1:N), "cid" => cid,
-        "x" => positions[:, 1], "y" => positions[:, 2], "z" => positions[:, 3],
-        "lx" => box[1], "ly" => box[2], "lz" => box[3],
+    data = SimData(
+        N, collect(1:N), cid,
+        positions[:, 1], positions[:, 2], positions[:, 3],
+        box[1], box[2], box[3],
     )
     return positions, data
 end
