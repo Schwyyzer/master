@@ -56,6 +56,28 @@ See git history on this file for the full trust-region derivation and the
 empirical dead ends, kept there rather than here since they didn't end up
 shaping the algorithm actually used.
 
+PARTIALLY adopted since then, as an opt-in: `trust_region_eps` (default
+`nothing`, meaning "off, behave exactly as above") replaces the Newton-
+step branch's flat `delta_x_max` clamp with a curvature-adaptive one,
+`min(2*eps*|h|/|lowest_eval|, delta_x_max)` -- the paper's Eq 5,
+specialized to a pure step along q0 (where g.Hg = q0.H.q0 = lowest_eval
+exactly, no approximation needed). This is NOT the g/alpha scheme above:
+the step DIRECTION is still exactly q0 as before, only the cap on its
+MAGNITUDE becomes curvature-aware instead of a flat number. Validated in
+Python (scratchpad's art_trust_step_only.py) on the same 22-seed, 500-atom
+sample this file's docstrings reference: eps=0.1 found one additional
+genuine saddle (seed 7, which previously ran to max_iterations without
+converging) with zero regressions elsewhere (6/22 -> 7/22), while
+eps=0.05/0.2/0.3 reproduced the flat-clamp baseline's outcome exactly
+(same successes, though not always identical intermediate eigenvalues --
+the cap only ever binds tighter than delta_x_max, never looser, so eps
+values where it rarely binds are indistinguishable from `nothing`). Traced
+to a single iteration where the eps=0.1 cap came out ~6% tighter than
+0.125, which was enough to redirect that seed's chaotic trajectory onto a
+convergent path -- a real, reproducible, mechanistically-understood
+effect, but based on one seed changing out of 22, not yet validated at
+scale. See run_parallel_fortran.jl's TRUST_REGION_EPS setting to use this.
+
 This is meant to be included AFTER Version1.1.jl (force / compute_energy /
 perpendicular_forces / config.jl / neighbor_pairs.jl / Hessian.jl /
 particle_movement.jl), same as art_core_no_tracking.jl.
@@ -308,6 +330,7 @@ function run_art_attempt_fortran(
     kick_magnitude::Float64 = 0.15,
     starting_fire_iterations::Int = 5,
     lanczos_iterations::Int = 10,
+    trust_region_eps::Union{Float64,Nothing} = nothing,
 )
     rng = MersenneTwister(seed)
     natoms = data["natoms"]
@@ -399,15 +422,30 @@ function run_art_attempt_fortran(
             evec_matrix = flat_to_matrix(evec)
             if lowest_eval < -eigenvalue_threshold
                 delta_x = dot(h_flat, evec) / lowest_eval
-                # matches the reference literally: clamps the MAGNITUDE to
-                # delta_x_max without preserving delta_x's sign. Harmless in
-                # practice -- the sign-alignment above guarantees
-                # dot(F,evec)<=0 and lowest_eval<0 here, so delta_x is
-                # always >=0 already, and the clamp is a no-op on sign.
-                if abs(delta_x) > delta_x_max
-                    delta_x = delta_x_max
+
+                if trust_region_eps === nothing
+                    # matches the reference literally: clamps the MAGNITUDE to
+                    # delta_x_max without preserving delta_x's sign. Harmless in
+                    # practice -- the sign-alignment above guarantees
+                    # dot(F,evec)<=0 and lowest_eval<0 here, so delta_x is
+                    # always >=0 already, and the clamp is a no-op on sign.
+                    if abs(delta_x) > delta_x_max
+                        delta_x = delta_x_max
+                    else
+                        n_fire += 1
+                    end
                 else
-                    n_fire += 1
+                    # Trust-region-adaptive cap (see this file's header for
+                    # what this is and how it was validated). Only ever
+                    # tighter than delta_x_max, never looser, so this is a
+                    # pure restriction of the original behavior, not a
+                    # wholesale change to it.
+                    cap = min(2.0 * trust_region_eps * h_norm / abs(lowest_eval), delta_x_max)
+                    if abs(delta_x) > cap
+                        delta_x = delta_x > 0 ? cap : -cap
+                    else
+                        n_fire += 1
+                    end
                 end
                 positions = positions .+ delta_x .* evec_matrix
             else

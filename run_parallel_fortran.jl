@@ -4,10 +4,12 @@ run_art_attempt_fortran -- the algorithm matching the working Fortran
 reference art_woconewer.f90 (unified FIRE+Newton-step loop, warm-started
 Lanczos mode tracking, no mass-weighting, static neighbor list, force-
 magnitude convergence), plus two validated additions from the trust-region
-paper (a second-eigenvalue validity guard, an MEP-proximity diagnostic).
+paper (a second-eigenvalue validity guard, an MEP-proximity diagnostic),
+plus an opt-in trust-region-adaptive Newton-step clamp (TRUST_REGION_EPS
+below; see art_core_fortran.jl's header for what this is, how it differs
+from the paper's own g/alpha scheme, and how it was validated).
 See art_core_fortran.jl's header for the full list of differences from
-run_parallel_no_tracking.jl's phase1/phase2 design, and for why that
-paper's own step-size scheme was tried and NOT adopted.
+run_parallel_no_tracking.jl's phase1/phase2 design.
 
 Modeled directly on run_parallel_no_tracking.jl; the differences are:
   - includes art_core_fortran.jl instead of art_core_no_tracking.jl
@@ -67,6 +69,15 @@ KICK_MAGNITUDE = 0.15
 STARTING_FIRE_ITERATIONS = 5
 LANCZOS_ITERATIONS = 10
 
+# Trust-region-adaptive cap on the Newton-step branch's step size, in
+# place of the flat DELTA_X_MAX clamp above (see art_core_fortran.jl's
+# header for what this is and how it was validated in Python: on a
+# 22-seed, 500-atom sample, eps=0.1 found one additional genuine saddle
+# with zero regressions elsewhere, 6/22 -> 7/22). Set to `nothing` to
+# fall back to the original flat DELTA_X_MAX clamp exactly (e.g. for an
+# A/B comparison against this run).
+TRUST_REGION_EPS = 0.1
+
 OUTPUT_DIR = "//home//schwyyzer//Desktop//Master Thesis//parallel_art_fortran_run_$(Dates.format(now(), "yyyymmdd_HHMMSS"))"
 DUMP_DIR = joinpath(OUTPUT_DIR, "dumps")
 LOG_PATH = joinpath(OUTPUT_DIR, "results.csv")
@@ -109,6 +120,7 @@ end
 @everywhere kick_magnitude = $KICK_MAGNITUDE
 @everywhere starting_fire_iterations = $STARTING_FIRE_ITERATIONS
 @everywhere lanczos_iterations = $LANCZOS_ITERATIONS
+@everywhere trust_region_eps = $TRUST_REGION_EPS
 @everywhere begin
     data = parse_lammps_data(lammps_path)
     positions0 = hcat(data["x"], data["y"], data["z"])
@@ -138,6 +150,7 @@ end
             kick_magnitude = kick_magnitude,
             starting_fire_iterations = starting_fire_iterations,
             lanczos_iterations = lanczos_iterations,
+            trust_region_eps = trust_region_eps,
         )
     end
 end
@@ -337,6 +350,7 @@ function print_minimal_summary(successes, positions0)
     println("mass = $mass")
     println("eigenvalue_threshold = $EIGENVALUE_THRESHOLD")
     println("delta_x_max = $DELTA_X_MAX")
+    println("trust_region_eps = $TRUST_REGION_EPS")
     println("delta_lm = $DELTA_LM")
     println("force_tolerance = $FORCE_TOLERANCE")
     println("zero_eigenvalue_threshold = $ZERO_EIGENVALUE_THRESHOLD")
