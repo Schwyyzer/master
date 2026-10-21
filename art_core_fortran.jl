@@ -87,25 +87,32 @@ using LinearAlgebra
 using SparseArrays
 using Random
 
-Base.@kwdef struct FortranAttemptResult
-    success::Bool
-    seed::Int
-    kicked_atom::Int
-    kick_dir::Vector{Float64}
-    initial_energy::Float64
-    final_energy::Float64 = NaN
-    crit_eigenvalue::Float64 = NaN
-    second_eigenvalue::Float64 = NaN
-    force_magnitude::Float64 = NaN
-    mep_proximity::Float64 = NaN
-    iteration::Int = 0
-    converged::Bool = false
-    is_saddle::Bool = false
-    degenerate_mode_aborted::Bool = false
-    second_eigenvalue_aborted::Bool = false
-    positions::Union{Matrix{Float64},Nothing} = nothing
-    dump_file::Union{String,Nothing} = nothing
-    error::Union{String,Nothing} = nothing
+# Guarded (see config.jl's `mass`/`rc`/etc. for the full explanation):
+# redefining a struct type -- which this file's own include-chain does on
+# any worker that already ran it in an earlier, still-alive invocation of
+# this script within the same Julia session -- is a hard error in Julia,
+# unlike redefining a function or plain variable.
+if !isdefined(@__MODULE__, :FortranAttemptResult)
+    Base.@kwdef struct FortranAttemptResult
+        success::Bool
+        seed::Int
+        kicked_atom::Int
+        kick_dir::Vector{Float64}
+        initial_energy::Float64
+        final_energy::Float64 = NaN
+        crit_eigenvalue::Float64 = NaN
+        second_eigenvalue::Float64 = NaN
+        force_magnitude::Float64 = NaN
+        mep_proximity::Float64 = NaN
+        iteration::Int = 0
+        converged::Bool = false
+        is_saddle::Bool = false
+        degenerate_mode_aborted::Bool = false
+        second_eigenvalue_aborted::Bool = false
+        positions::Union{Matrix{Float64},Nothing} = nothing
+        dump_file::Union{String,Nothing} = nothing
+        error::Union{String,Nothing} = nothing
+    end
 end
 
 # Flat (3*natoms, atom-major x,y,z) <-> natoms x 3 matrix, matching the
