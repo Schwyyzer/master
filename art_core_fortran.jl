@@ -316,8 +316,22 @@ port. max_consecutive_second_eig_negative=5 is new and unvalidated beyond
 it since the paper's own description (abort on the first negative reading)
 is what the validation showed to be too strict here.
 
-`success` requires force convergence AND a genuinely negative final
-eigenvalue AND no abort (degenerate-mode or second-eigenvalue).
+`success` matches art_woconewer.f90's own output-writing criterion
+exactly: true whenever the attempt reaches the end of the loop (by force
+convergence OR by hitting max_iterations) WITHOUT being discarded by the
+degenerate-mode or second-eigenvalue guard. The reference writes every
+non-degenerate attempt's configuration to its own numbered output file
+regardless of whether force_magnitude actually dropped below
+force_tolerance and regardless of whether the final point has negative
+curvature -- it does not bake a stricter "is this actually a converged
+saddle" check into the search itself, leaving that to separate validation
+(this project's own validate_saddles.jl/.py). `converged` and `is_saddle`
+are still computed and returned so a caller can filter on them, but
+neither gates `success` or whether `positions`/`dump_file` get populated
+-- every non-aborted attempt returns both now. (An earlier version of
+this file required `converged && is_saddle` for `success`; that was a
+stricter criterion we'd added ourselves, not something the reference
+does -- see git history.)
 """
 function run_art_attempt_fortran(
     seed::Int,
@@ -470,9 +484,12 @@ function run_art_attempt_fortran(
 
         energy = compute_energy(positions, data["cid"], box, epsilon_table, sigma_table, pairs_static)
         is_saddle = lowest_eval < 0
-        success = converged && is_saddle
+        # Reaching here means neither guard above fired -- matches the
+        # reference's own "write output unless degenerate-aborted"
+        # criterion exactly (see this function's docstring).
+        success = true
 
-        if success && dump_file !== nothing
+        if dump_file !== nothing
             open(dump_file, "w") do io end
             write_lammps_frame(
                 dump_file, iteration, positions, data["id"], data["cid"],
@@ -485,8 +502,8 @@ function run_art_attempt_fortran(
             final_energy=energy, crit_eigenvalue=lowest_eval, second_eigenvalue=second_eval,
             force_magnitude=force_mag, mep_proximity=mep_proximity_min,
             iteration, converged, is_saddle,
-            positions = success ? positions : nothing,
-            dump_file = success ? dump_file : nothing,
+            positions,
+            dump_file,
         )
 
     catch e

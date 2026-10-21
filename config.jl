@@ -54,5 +54,11 @@ if !isdefined(@__MODULE__, :sigma_table)
     const sigma_table = [1.0 11/12; 11/12 5/6]
 end
 if !isdefined(@__MODULE__, :rc)
-    const rc = 6.0 # LJ cutoff
+    # 2.5, matching art_woconewer.f90's `rc=2.5`/`range=2.5` exactly --
+    # confirmed directly from that source (see git history). The prior
+    # 6.0 here was a stale leftover never actually matched to the
+    # reference; harmless in that it didn't crash anything (LJ decays
+    # fast enough that the extra distant pairs barely contribute), but
+    # still the wrong cutoff.
+    const rc = 2.5 # LJ cutoff
 end

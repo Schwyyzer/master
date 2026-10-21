@@ -22,9 +22,16 @@ Modeled directly on run_parallel_no_tracking.jl; the differences are:
     range_nn = range+1.0) from the starting minimum, shared read-only by
     every attempt and never rebuilt -- not a fresh pairs0 handed to
     run_art_attempt like the old driver; this file's attempt_wrapper reuses
-    the module-level `pairs_static` directly, and TARGET_SUCCESSES now
-    counts attempts that reach a genuinely converged, genuinely negative
-    final eigenvalue (see art_core_fortran.jl's `success` docstring note)
+    the module-level `pairs_static` directly, and TARGET_SUCCESSES counts
+    attempts that reach the end of the search loop WITHOUT being discarded
+    by the degenerate-mode/second-eigenvalue guards -- matching
+    art_woconewer.f90's own "write output unless degenerate" criterion
+    exactly, not "strictly converged to a negative eigenvalue" (see
+    art_core_fortran.jl's `success` docstring). That stricter check isn't
+    gone -- `converged` and `is_saddle` are in every row of the CSV and in
+    every FortranAttemptResult, so you can filter on them, or (recommended,
+    and what the reference's own workflow implies) run validate_saddles.jl/
+    .py over the dump files afterward for an independent saddle check.
 
 Usage:  julia run_parallel_fortran.jl
 =#
@@ -364,9 +371,16 @@ function print_minimal_summary(successes, positions0)
     println("\n=== starting position ($(size(positions0,1)) atoms) ===")
     print_positions(positions0)
 
-    println("\n=== saddle point positions ($(length(successes)) found) ===")
+    # "success" now means "not discarded by the degenerate-mode/second-
+    # eigenvalue guard" (matching the Fortran reference's own output
+    # criterion -- see art_core_fortran.jl's success docstring), not
+    # "independently confirmed saddle". converged/is_saddle are shown per
+    # entry so you can see which of these also meet the stricter check;
+    # validate_saddles.jl/.py over these positions is the real filter.
+    println("\n=== exported attempt positions ($(length(successes)) found) ===")
     for s in successes
-        println("\n--- seed=$(s.seed)  final_energy=$(s.final_energy)  crit_eigenvalue=$(s.crit_eigenvalue) ---")
+        println("\n--- seed=$(s.seed)  final_energy=$(s.final_energy)  crit_eigenvalue=$(s.crit_eigenvalue) " *
+                "converged=$(s.converged)  is_saddle=$(s.is_saddle) ---")
         print_positions(s.positions)
     end
 end
