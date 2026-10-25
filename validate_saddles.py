@@ -61,6 +61,7 @@ calibrated against and the exact escalation logic.
 import csv
 import numpy as np
 from scipy.spatial import cKDTree
+from scipy.optimize import linear_sum_assignment
 
 # =====================================================================
 # Config -- EDIT THESE to match what actually produced your CSV
@@ -99,6 +100,21 @@ PUSH_MAGNITUDES = [0.01, 0.02, 0.05, 0.1, 0.2, 0.35, 0.5]   # tried smallest-fir
 # scale; MAX_DISP_PLUS_MINUS is printed for every saddle so you can
 # sanity check/adjust it against your own data.
 MAX_ATOM_DISP_SAME_THRESHOLD = 0.05
+
+# ---------------------------------------------------------------------
+# Mechanism classification (free volume hop / pair swap / chain / ...)
+# ---------------------------------------------------------------------
+# Classifies each CONFIRMED saddle's transition mechanism from the same
+# pos_plus/pos_minus pair find_decisive_push already computes above --
+# no extra relaxations, just a shape analysis of the displacement field
+# between the two basins a saddle actually connects (not the local
+# unstable eigenvector/MOVE vector at the saddle itself, which only
+# captures the onset direction and can miss atoms that only move during
+# the subsequent relaxation into each basin).
+MECHANISM_CSV = "mechanism_classification.csv"
+ACTIVE_FRACTION = 0.2      # an atom counts as "active" if its pos_plus/pos_minus
+                            # displacement exceeds this fraction of the single
+                            # largest displacement in that saddle's field
 
 
 # =====================================================================
@@ -402,6 +418,115 @@ def find_decisive_push(positions_saddle, move, max_atom_disp, magnitudes, max_di
     return last_result
 
 
+def classify_mechanism(pos_plus, pos_minus, box, active_fraction=ACTIVE_FRACTION):
+    """
+    Characterize the atomic rearrangement a saddle connects, from the two
+    relaxed endpoints find_decisive_push already produced (pos_plus,
+    pos_minus) -- the actual transition, not just the saddle's local
+    unstable direction.
+
+    Reduces the per-atom displacement field to atom-order/count-invariant
+    numbers:
+      - participation_ratio / n_eff: the standard inverse-participation-
+        ratio localization measure (sum(d^2))^2 / (N*sum(d^4)), as an
+        EFFECTIVE atom count with no threshold -- one atom moving gives
+        ~1, two equally-displaced atoms give ~2, N equally-displaced
+        atoms give ~N, continuously.
+      - n_active: a thresholded version (any atom moving more than
+        active_fraction of the single largest displacement), used to
+        build a concrete atom set for the swap/chain detection below,
+        since that needs an actual set, not a continuous number.
+      - radius_of_gyration: how spatially compact the active atoms are
+        (PBC-unwrapped relative to the most-displaced one) -- a hop or
+        pair swap is compact; a propagating chain is elongated.
+      - longest_cycle / n_cycles: solves the optimal assignment (Hungarian
+        algorithm) between {active atoms' pos_plus} and {active atoms'
+        pos_minus} -- i.e. "which active atom ends up where which other
+        active atom started" -- and decomposes it into cycles. A fixed
+        point (atom i maps to itself) means it moved without exchanging
+        places with another active atom (a hop into free volume with no
+        one taking its place); a length-2 cycle is a direct pair swap; a
+        length>=3 cycle is a ring -- the signature of free volume
+        propagating through a chain of atoms (each moving into the next
+        one's vacated spot).
+
+    Returns a dict with all of the above plus a best-guess `category`
+    string from simple rules on top of them -- meant as a sorting aid to
+    pick representatives for manual OVITO inspection, not a rigorous
+    physical classification. Tune active_fraction/the rules below against
+    your own data if a category looks wrong on inspection.
+    """
+    dr = pos_plus - pos_minus
+    dr -= box * np.round(dr / box)
+    disp = np.linalg.norm(dr, axis=1)
+    max_disp = disp.max()
+
+    s2 = np.sum(disp**2)
+    s4 = np.sum(disp**4)
+    participation_ratio = (s2 * s2) / (len(disp) * s4) if s4 > 0 else 0.0
+    n_eff = participation_ratio * len(disp)
+
+    active = np.where(disp > active_fraction * max_disp)[0]
+    n_active = len(active)
+
+    if n_active >= 2:
+        anchor_pos = pos_plus[active[np.argmax(disp[active])]]
+        unwrapped = []
+        for idx in active:
+            d = pos_plus[idx] - anchor_pos
+            d -= box * np.round(d / box)
+            unwrapped.append(anchor_pos + d)
+        unwrapped = np.array(unwrapped)
+        centroid = unwrapped.mean(axis=0)
+        radius_of_gyration = float(np.sqrt(np.mean(np.sum((unwrapped - centroid) ** 2, axis=1))))
+
+        D = np.zeros((n_active, n_active))
+        for a, i in enumerate(active):
+            for b, j in enumerate(active):
+                d = pos_plus[i] - pos_minus[j]
+                d -= box * np.round(d / box)
+                D[a, b] = np.linalg.norm(d)
+        row_ind, col_ind = linear_sum_assignment(D)
+        sigma = {int(active[a]): int(active[col_ind[a]]) for a in row_ind}
+
+        visited = set()
+        cycles = []
+        for i in active:
+            i = int(i)
+            if i in visited:
+                continue
+            cyc = [i]
+            visited.add(i)
+            j = sigma[i]
+            while j != i:
+                cyc.append(j)
+                visited.add(j)
+                j = sigma[j]
+            cycles.append(cyc)
+        nontrivial_cycles = [c for c in cycles if len(c) >= 2]
+    else:
+        radius_of_gyration = 0.0
+        nontrivial_cycles = []
+
+    longest_cycle = max((len(c) for c in nontrivial_cycles), default=0)
+    n_cycles = len(nontrivial_cycles)
+
+    if n_active <= 1:
+        category = "single-atom hop"
+    elif longest_cycle == 2 and n_cycles == 1 and n_active == 2:
+        category = "pair swap"
+    elif longest_cycle >= 3:
+        category = "chain / propagating free volume"
+    elif longest_cycle == 0 and n_active <= 3:
+        category = "localized hop (few atoms, no exchange)"
+    else:
+        category = "collective / diffuse"
+
+    return dict(n_active=n_active, n_eff=n_eff, participation_ratio=participation_ratio,
+                max_disp=float(max_disp), radius_of_gyration=radius_of_gyration,
+                longest_cycle=longest_cycle, n_cycles=n_cycles, category=category)
+
+
 # =====================================================================
 # Main
 # =====================================================================
@@ -447,6 +572,7 @@ def main():
     n_pass = n_fail = n_error = 0
     saddle_seeds = []
     saddle_positions = []
+    mechanisms = []
 
     for r in successes:
         line = f"seed={r['seed']}  dump={r['dump_file']}"
@@ -500,6 +626,14 @@ def main():
             n_pass += is_different
             n_fail += not is_different
 
+            mechanism_line = ""
+            if is_different:
+                mechanism = classify_mechanism(pos_plus, pos_minus, box)
+                mechanisms.append(dict(seed=r["seed"], dump_file=r["dump_file"],
+                                        barrier=r["final_energy"] - initial_energy, **mechanism))
+                mechanism_line = (f"  mechanism={mechanism['category']}  n_active={mechanism['n_active']}  "
+                                   f"n_eff={mechanism['n_eff']:.2f}  Rg={mechanism['radius_of_gyration']:.3f}\n")
+
             print(f"{line}\n"
                   f"  push_used=+-{mag:.3g}{'  (largest tried)' if mag == PUSH_MAGNITUDES[-1] else ''}  "
                   f"E_plus={e_plus:.6f}  E_minus={e_minus:.6f}  "
@@ -508,7 +642,8 @@ def main():
                   f"[whole-system RMSD(plus,minus)={rmsd_plus_minus:.5f}]\n"
                   f"  RMSD(plus,start)={rmsd_plus_start:.5f}  "
                   f"RMSD(minus,start)={rmsd_minus_start:.5f}\n"
-                  f"  {verdict}\n")
+                  f"  {verdict}\n"
+                  f"{mechanism_line}")
         except Exception as e:
             print(f"{line}\n  ERROR: {e}\n")
             n_error += 1
@@ -552,6 +687,45 @@ def main():
             print("rediscovering the same handful of transitions rather than finding distinct")
             print("saddle points -- worth revisiting phase-1 direction selection / kick-direction")
             print("continuity (diagnosed earlier as the low-diversity issue, not yet addressed).")
+
+    # =================================================================
+    # Mechanism classification summary -- group CONFIRMED saddles by
+    # transition type (see classify_mechanism's docstring) and suggest
+    # one representative dump per category to actually open in OVITO,
+    # instead of looking through all of them by hand.
+    # =================================================================
+    if mechanisms:
+        with open(MECHANISM_CSV, "w", newline="") as f:
+            fieldnames = ["seed", "dump_file", "category", "barrier", "n_active", "n_eff",
+                          "participation_ratio", "max_disp", "radius_of_gyration",
+                          "longest_cycle", "n_cycles"]
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for m in mechanisms:
+                writer.writerow({k: m[k] for k in fieldnames})
+        print(f"\nWrote per-saddle mechanism descriptors to {MECHANISM_CSV} "
+              f"({len(mechanisms)} confirmed saddles)")
+
+        from collections import defaultdict
+        by_category = defaultdict(list)
+        for m in mechanisms:
+            by_category[m["category"]].append(m)
+
+        print(f"\n=== Mechanism breakdown: {len(by_category)} categories among "
+              f"{len(mechanisms)} confirmed saddles ===")
+        for cat in sorted(by_category, key=lambda c: -len(by_category[c])):
+            group = sorted(by_category[cat], key=lambda m: m["n_active"])
+            rep = group[len(group) // 2]   # median by n_active -- a "typical" example, not an outlier
+            print(f"  {cat}: {len(group)} saddle(s) -- seeds "
+                  f"{[m['seed'] for m in group]}")
+            print(f"      representative: seed={rep['seed']}  dump={rep['dump_file']}  "
+                  f"n_active={rep['n_active']}  n_eff={rep['n_eff']:.2f}  "
+                  f"Rg={rep['radius_of_gyration']:.3f}  barrier={rep['barrier']:.5f}")
+        print(f"\nOpen each category's representative dump_file in OVITO for one example of each")
+        print(f"mechanism -- see {MECHANISM_CSV} for the full per-saddle numbers if you want to")
+        print(f"pick a different representative (e.g. by barrier height instead of n_active), or")
+        print(f"tune ACTIVE_FRACTION/the category rules in classify_mechanism if a label looks")
+        print(f"wrong once you've looked at it.")
 
 
 if __name__ == "__main__":
