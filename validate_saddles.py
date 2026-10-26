@@ -214,6 +214,27 @@ def compute_energy(coords, types, box, pairs):
     sig = SIGMA_TABLE[ti, tj]
     inv_r6 = (sig**2 / r2)**3
     energy = 4 * eps * (inv_r6**2 - inv_r6)
+    # Shift by V(rc) so energy vanishes continuously at the cutoff --
+    # matches Version1.1.jl's compute_energy (and the validated
+    # art_driver.py port). Without this, every absolute energy computed
+    # here was systematically offset from results.csv's own values (by
+    # an amount proportional to how many pairs are within cutoff), which
+    # is exactly what made the "computed initial_energy doesn't match
+    # the CSV" warning fire every time regardless of whether
+    # RC/EPSILON_TABLE/SIGMA_TABLE/LAMMPS_PATH actually matched. PASS/FAIL
+    # verdicts and barrier heights were unaffected (the same shift-less
+    # formula was applied consistently everywhere in this file) -- only
+    # that one absolute-value sanity check was ever wrong.
+    inv_rc6 = (sig**2 / (RC * RC))**3
+    shift = 4 * eps * (inv_rc6**2 - inv_rc6)
+    # Mask to r<=RC directly rather than trusting `pairs` alone: it's
+    # normally already built at exactly RC via build_neighbor_pairs, but
+    # relax_unconstrained only rebuilds it every `rebuild_every` steps,
+    # so it can go briefly stale as positions drift between rebuilds --
+    # same defensive mask used throughout the rest of this project's
+    # force()/compute_energy.
+    mask = (r2 <= RC * RC) & (r2 > 0)
+    energy = np.where(mask, energy - shift, 0.0)
     return np.sum(energy)
 
 
