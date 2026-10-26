@@ -75,13 +75,14 @@ MIN_MARKER_SIZE = 50
 MAX_MARKER_SIZE = 260
 
 
-def pick_transition_frames(seed, data0, positions0, box):
-    """For the given seed's row in RESULTS_CSV, return
-    (positions_saddle, new_min, old_min, barrier) where new_min is whichever
-    of the push-relax endpoints is NOT close to the shared starting minimum
-    (old_min is the other one, included for a sanity check/diagnostic, not
-    for plotting -- the figure uses positions0 itself as "initial")."""
-    rows = vs.parse_results_csv(vs.RESULTS_CSV)
+def pick_transition_frames(seed, data0, positions0, box, results_csv=None):
+    """For the given seed's row in `results_csv` (default: vs.RESULTS_CSV),
+    return (positions_saddle, new_min, old_min, barrier) where new_min is
+    whichever of the push-relax endpoints is NOT close to the shared
+    starting minimum (old_min is the other one, included for a sanity
+    check/diagnostic, not for plotting -- the figure uses positions0 itself
+    as "initial")."""
+    rows = vs.parse_results_csv(results_csv if results_csv is not None else vs.RESULTS_CSV)
     matches = [r for r in rows if r["success"] and r["seed"] == seed]
     if not matches:
         raise SystemExit(f"seed {seed} not found as a successful row in {vs.RESULTS_CSV}")
