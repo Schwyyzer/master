@@ -32,6 +32,15 @@ Modeled directly on run_parallel_no_tracking.jl; the differences are:
     every FortranAttemptResult, so you can filter on them, or (recommended,
     and what the reference's own workflow implies) run validate_saddles.jl/
     .py over the dump files afterward for an independent saddle check.
+  - each attempt also gets `elapsed_time` (whole-attempt wall-clock
+    seconds, in the CSV) and, unless MINIMAL_OUTPUT, a per-iteration
+    step-norm trajectory CSV under TRAJECTORY_DIR (path in the CSV's
+    `trajectory_file` column) -- added for comparing the trust-region-
+    adaptive Newton-step clamp (TRUST_REGION_EPS) against the flat
+    DELTA_X_MAX one: both computational cost and the actual step-size
+    behavior over a run are otherwise invisible in results.csv's one row
+    per attempt. See art_core_fortran.jl's write_trajectory_csv docstring
+    for the trajectory file's exact format.
 
 Usage:  julia run_parallel_fortran.jl
 =#
@@ -52,7 +61,8 @@ MAX_ITERATIONS = 200                      # matches art_woconewer.f90's max_numb
 
 # When true: no per-attempt CSV log (and no flush() after every attempt --
 # a real cost over thousands of failed attempts), no per-success dump
-# files, no progress printlns, no diversity/RMSD report. Instead, at the
+# files, no per-attempt trajectory files, no progress printlns, no
+# diversity/RMSD report. Instead, at the
 # very end of the run, print ONLY the config variables that were actually
 # used, the starting position, and the saddle point positions found --
 # nothing else. Use this when you just want the result, not the
@@ -105,9 +115,11 @@ TRUST_REGION_EPS = nothing
 
 OUTPUT_DIR = "//home//schwyyzer//Desktop//Master Thesis//parallel_art_fortran_run_$(Dates.format(now(), "yyyymmdd_HHMMSS"))"
 DUMP_DIR = joinpath(OUTPUT_DIR, "dumps")
+TRAJECTORY_DIR = joinpath(OUTPUT_DIR, "trajectories")
 LOG_PATH = joinpath(OUTPUT_DIR, "results.csv")
 
 mkpath(DUMP_DIR)
+mkpath(TRAJECTORY_DIR)
 
 # ============================================================
 # Worker setup
@@ -160,10 +172,11 @@ end
     # every pair to r<=rc internally regardless of the candidate list.
     pairs_static = build_neighbor_pairs(positions0, rc + 0.5, box)
 
-    function attempt_wrapper(seed::Int, dump_path::String)
+    function attempt_wrapper(seed::Int, dump_path::String, trajectory_path::String)
         run_art_attempt_fortran(
             seed, positions0, data, pairs_static, box;
             dump_file = minimal_output ? nothing : dump_path,
+            trajectory_file = minimal_output ? nothing : trajectory_path,
             max_iterations = max_iterations,
             eigenvalue_threshold = eigenvalue_threshold,
             delta_x_max = delta_x_max,
@@ -197,7 +210,8 @@ function run_batch()
     function dispatch!(w)
         s = next_seed()
         dump_path = joinpath(DUMP_DIR, "saddle_$(lpad(s, 6, '0')).dump")
-        return remotecall(attempt_wrapper, w, s, dump_path)
+        trajectory_path = joinpath(TRAJECTORY_DIR, "trajectory_$(lpad(s, 6, '0')).csv")
+        return remotecall(attempt_wrapper, w, s, dump_path, trajectory_path)
     end
 
     pending = Dict{Int,Future}()
@@ -215,7 +229,7 @@ function run_batch()
         println(log_io,
             "seed,success,kicked_atom,iterations,crit_eigenvalue,second_eigenvalue,converged,is_saddle," *
             "force_magnitude,mep_proximity,initial_energy,final_energy,degenerate_mode_aborted," *
-            "second_eigenvalue_aborted,dump_file,error"
+            "second_eigenvalue_aborted,elapsed_time,dump_file,trajectory_file,error"
         )
         flush(log_io)
     end
@@ -240,11 +254,13 @@ function run_batch()
                 if !MINIMAL_OUTPUT
                     err_field = res.error === nothing ? "" : replace(res.error, "\n" => " | ", "," => ";")
                     dump_field = res.dump_file === nothing ? "" : res.dump_file
+                    trajectory_field = res.trajectory_file === nothing ? "" : res.trajectory_file
                     println(log_io,
                         "$(res.seed),$(res.success),$(res.kicked_atom),$(res.iteration),$(res.crit_eigenvalue)," *
                         "$(res.second_eigenvalue),$(res.converged),$(res.is_saddle),$(res.force_magnitude)," *
                         "$(res.mep_proximity),$(res.initial_energy),$(res.final_energy)," *
-                        "$(res.degenerate_mode_aborted),$(res.second_eigenvalue_aborted),$dump_field,$err_field"
+                        "$(res.degenerate_mode_aborted),$(res.second_eigenvalue_aborted),$(res.elapsed_time)," *
+                        "$dump_field,$trajectory_field,$err_field"
                     )
                     flush(log_io)
                 end

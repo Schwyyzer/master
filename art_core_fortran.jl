@@ -111,6 +111,8 @@ if !isdefined(@__MODULE__, :FortranAttemptResult)
         second_eigenvalue_aborted::Bool = false
         positions::Union{Matrix{Float64},Nothing} = nothing
         dump_file::Union{String,Nothing} = nothing
+        trajectory_file::Union{String,Nothing} = nothing
+        elapsed_time::Float64 = NaN
         error::Union{String,Nothing} = nothing
     end
 end
@@ -120,6 +122,29 @@ end
 # (particle_movement.jl's calculate_moves, art_core_no_tracking.jl).
 flat_to_matrix(v::AbstractVector) = permutedims(reshape(v, 3, :))
 matrix_to_flat(M::AbstractMatrix) = vec(permutedims(M))
+
+"""
+    write_trajectory_csv(path, step_norms)
+
+One row per outer iteration: `step_norm` is the magnitude of that
+iteration's push along the tracked eigenvector (`delta_x` in the Newton
+branch, clamped either by `delta_x_max` or the trust-region cap; `delta_lm`
+in the destabilization branch) -- i.e. the norm of the actual displacement
+applied to the full 3N-dimensional configuration that iteration, not just
+a per-atom quantity. This equals the push scalar directly (not a separate
+norm() computation) because `evec` is always unit-norm (renormalized at
+the end of `lanczos_lowest_eigenvalues`), so `delta_x .* evec_matrix` (or
+`delta_lm .* evec_matrix`) as a flattened vector has Euclidean norm exactly
+`abs(delta_x)` (or `delta_lm`).
+"""
+function write_trajectory_csv(path, step_norms)
+    open(path, "w") do io
+        println(io, "iteration,step_norm")
+        for (i, s) in enumerate(step_norms)
+            println(io, "$i,$s")
+        end
+    end
+end
 
 """
     lanczos_lowest_eigenvalues(H, v0; n_iter=10)
@@ -316,6 +341,15 @@ port. max_consecutive_second_eig_negative=5 is new and unvalidated beyond
 it since the paper's own description (abort on the first negative reading)
 is what the validation showed to be too strict here.
 
+`elapsed_time` (wall-clock seconds for this ONE attempt, from function
+entry to return) and, if `trajectory_file` is given, a per-iteration
+step-norm CSV (see `write_trajectory_csv`) are recorded on every non-crash
+return (success or either guard abort) -- added for comparing the trust-
+region-adaptive Newton-step clamp against the flat `delta_x_max` one: both
+computational cost (elapsed_time) and the actual step-size behavior over
+the course of a run (the trajectory) are otherwise invisible in the
+single-row-per-attempt results.csv.
+
 `success` matches art_woconewer.f90's own output-writing criterion
 exactly: true whenever the attempt reaches the end of the loop (by force
 convergence OR by hitting max_iterations) WITHOUT being discarded by the
@@ -340,6 +374,7 @@ function run_art_attempt_fortran(
     pairs_static::Matrix{Int},
     box;
     dump_file::Union{String,Nothing} = nothing,
+    trajectory_file::Union{String,Nothing} = nothing,
     max_iterations::Int = 200,
     eigenvalue_threshold::Float64 = 3.0,
     delta_x_max::Float64 = 0.125,
@@ -353,6 +388,8 @@ function run_art_attempt_fortran(
     lanczos_iterations::Int = 10,
     trust_region_eps::Union{Float64,Nothing} = nothing,
 )
+    t_start = time()   # whole-attempt wall-clock; read at every return below
+
     rng = MersenneTwister(seed)
     natoms = data["natoms"]
 
@@ -382,6 +419,13 @@ function run_art_attempt_fortran(
         force_mag = Inf   # must predate the loop: read in the final return after it ends
         mep_proximity_min = Inf
         current_forces = zeros(natoms, 3)   # reused every iteration via force!
+        step_norms = Float64[]   # one entry per push actually applied: length(step_norms)
+                                   # == iteration on the success return (that iteration's
+                                   # push happens before the convergence check below), but
+                                   # == iteration-1 on a guard-abort return (the aborting
+                                   # iteration detects the guard BEFORE ever deciding on/
+                                   # applying a push) -- written to trajectory_file at
+                                   # whichever return below fires
 
         while !converged
             iteration += 1
@@ -409,11 +453,15 @@ function run_art_attempt_fortran(
                 zero_eig_count += 1
                 if zero_eig_count > max_zero_eigenvalue_threshold_number
                     energy = compute_energy(positions, data["cid"], box, epsilon_table, sigma_table, pairs_static)
+                    if trajectory_file !== nothing
+                        write_trajectory_csv(trajectory_file, step_norms)
+                    end
                     return FortranAttemptResult(;
                         success=false, seed, kicked_atom, kick_dir, initial_energy,
                         final_energy=energy, crit_eigenvalue=lowest_eval, second_eigenvalue=second_eval,
                         force_magnitude=force_mag, mep_proximity=mep_proximity_min,
                         iteration, degenerate_mode_aborted=true,
+                        trajectory_file, elapsed_time=time() - t_start,
                         error="possible translational mode, aborted (|eigenvalue|<$(zero_eigenvalue_threshold) " *
                               "for >$(max_zero_eigenvalue_threshold_number) consecutive iterations)",
                     )
@@ -426,11 +474,15 @@ function run_art_attempt_fortran(
                 second_eig_neg_count += 1
                 if second_eig_neg_count > max_consecutive_second_eig_negative
                     energy = compute_energy(positions, data["cid"], box, epsilon_table, sigma_table, pairs_static)
+                    if trajectory_file !== nothing
+                        write_trajectory_csv(trajectory_file, step_norms)
+                    end
                     return FortranAttemptResult(;
                         success=false, seed, kicked_atom, kick_dir, initial_energy,
                         final_energy=energy, crit_eigenvalue=lowest_eval, second_eigenvalue=second_eval,
                         force_magnitude=force_mag, mep_proximity=mep_proximity_min,
                         iteration, second_eigenvalue_aborted=true,
+                        trajectory_file, elapsed_time=time() - t_start,
                         error="second-lowest eigenvalue stayed negative for >$(max_consecutive_second_eig_negative) " *
                               "consecutive iterations (currently $(second_eval)) -- sustained 2+ unstable " *
                               "directions, the eventual saddle may not be adjacent to the starting minimum",
@@ -468,9 +520,11 @@ function run_art_attempt_fortran(
                         n_fire += 1
                     end
                 end
+                push!(step_norms, abs(delta_x))
                 positions = positions .+ delta_x .* evec_matrix
             else
                 n_fire = starting_fire_iterations
+                push!(step_norms, delta_lm)
                 positions = positions .+ delta_lm .* evec_matrix
             end
 
@@ -496,6 +550,9 @@ function run_art_attempt_fortran(
                 (data["lx"], data["ly"], data["lz"]), flat_to_matrix(evec)
             )
         end
+        if trajectory_file !== nothing
+            write_trajectory_csv(trajectory_file, step_norms)
+        end
 
         return FortranAttemptResult(;
             success, seed, kicked_atom, kick_dir, initial_energy,
@@ -504,12 +561,14 @@ function run_art_attempt_fortran(
             iteration, converged, is_saddle,
             positions,
             dump_file,
+            trajectory_file, elapsed_time=time() - t_start,
         )
 
     catch e
         return FortranAttemptResult(;
             success=false, seed, kicked_atom, kick_dir, initial_energy,
-            iteration, error="[iteration=$(iteration)] " * sprint(showerror, e),
+            iteration, elapsed_time=time() - t_start,
+            error="[iteration=$(iteration)] " * sprint(showerror, e),
         )
     end
 end
