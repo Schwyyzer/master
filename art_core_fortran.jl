@@ -117,6 +117,25 @@ if !isdefined(@__MODULE__, :FortranAttemptResult)
     end
 end
 
+# Catches the stale-struct problem the guard above can't prevent: if
+# FortranAttemptResult was ALREADY defined in this process (master or any
+# worker) from an earlier run in the same Julia session, the block above
+# skips re-declaring it -- correctly, since Julia can't hot-reload a
+# changed struct definition -- but that silently means this process keeps
+# running with whatever fields that EARLIER definition had. Fail loudly
+# and immediately here (at include-time) instead of letting it surface
+# later as a confusing `FieldError: no field trajectory_file` deep inside
+# run_batch(), after real compute has already happened.
+if !(:trajectory_file in fieldnames(FortranAttemptResult)) || !(:elapsed_time in fieldnames(FortranAttemptResult))
+    error(
+        "FortranAttemptResult is already defined in this Julia process from an earlier run, and is " *
+        "missing fields this version of art_core_fortran.jl expects (trajectory_file/elapsed_time). " *
+        "Julia cannot hot-reload a changed struct definition into an already-running process -- " *
+        "re-running or re-including this script in the SAME session/REPL (with workers still alive) " *
+        "will not pick up the change. Fully exit Julia and start a fresh process before running again."
+    )
+end
+
 # Flat (3*natoms, atom-major x,y,z) <-> natoms x 3 matrix, matching the
 # `reshape(v, 3, :)'` convention already used elsewhere in this codebase
 # (particle_movement.jl's calculate_moves, art_core_no_tracking.jl).
