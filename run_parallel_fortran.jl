@@ -41,6 +41,13 @@ Modeled directly on run_parallel_no_tracking.jl; the differences are:
     behavior over a run are otherwise invisible in results.csv's one row
     per attempt. See art_core_fortran.jl's write_trajectory_csv docstring
     for the trajectory file's exact format.
+  - TARGET_ATTEMPTS (opt-in, nothing by default) can replace TARGET_SUCCESSES
+    as the stopping criterion: run a FIXED budget of attempts instead of
+    running until a target success count is reached. Useful for comparing
+    two settings' success RATE on equal footing -- targeting a success
+    count means a worse-performing setting burns more attempts (and more
+    wall-clock time) to reach the same count, confounding any such
+    comparison; a fixed attempt budget doesn't.
 
 Usage:  julia run_parallel_fortran.jl
 =#
@@ -56,6 +63,15 @@ using DelimitedFiles
 # ============================================================
 LAMMPS_PATH = "//home//schwyyzer//Desktop//Master Thesis//config_small_relaxed.lammps"
 TARGET_SUCCESSES = 50
+# Opt-in: set to an Int to run a FIXED BUDGET of attempts instead of running
+# until TARGET_SUCCESSES successes are found. TARGET_SUCCESSES is ignored
+# when this is set (not a race between the two -- this one wins outright).
+# Useful for a clean, unbiased success-RATE measurement (e.g. comparing
+# TRUST_REGION_EPS settings): targeting successes means a worse-performing
+# setting runs more attempts to reach the same count, so wall-clock time and
+# n_attempts both confound the comparison; targeting a fixed attempt count
+# does not.
+TARGET_ATTEMPTS = nothing
 N_WORKERS = max(1, Sys.CPU_THREADS - 1)   # leave a core free for the OS/master
 MAX_ITERATIONS = 200                      # matches art_woconewer.f90's max_number_of_art_iterations
 
@@ -200,7 +216,8 @@ if !MINIMAL_OUTPUT
 end
 
 # ============================================================
-# Dispatch loop: keep every worker busy until TARGET_SUCCESSES
+# Dispatch loop: keep every worker busy until TARGET_SUCCESSES successes
+# (or, if TARGET_ATTEMPTS is set, until that many total attempts complete)
 # (see run_parallel_no_tracking.jl for why this is wrapped in a function)
 # ============================================================
 function run_batch()
@@ -236,7 +253,11 @@ function run_batch()
 
     live_workers = Set(workers())
 
-    while length(successes) < TARGET_SUCCESSES && !isempty(live_workers)
+    # TARGET_ATTEMPTS, when set, overrides TARGET_SUCCESSES as the stopping
+    # criterion entirely (see its definition above).
+    done() = TARGET_ATTEMPTS === nothing ? length(successes) >= TARGET_SUCCESSES : n_attempts >= TARGET_ATTEMPTS
+
+    while !done() && !isempty(live_workers)
         for w in collect(keys(pending))
             fut = pending[w]
             if isready(fut)
@@ -269,13 +290,17 @@ function run_batch()
                     guard_aborts += 1
                 end
 
+                progress() = TARGET_ATTEMPTS === nothing ?
+                    "[$(length(successes))/$TARGET_SUCCESSES successes]" :
+                    "[$n_attempts/$TARGET_ATTEMPTS attempts, $(length(successes)) successes]"
+
                 if res.success
                     push!(successes, res)
                     if !MINIMAL_OUTPUT
                         elapsed = round(time() - start_time, digits=1)
                         @printf(
-                            "[%2d/%2d] SUCCESS  seed=%-6d atom=%-5d E=%.6f  iters=%-4d  eig=%.5f  elapsed=%.1fs  attempts_so_far=%d\n",
-                            length(successes), TARGET_SUCCESSES, res.seed, res.kicked_atom,
+                            "%s SUCCESS  seed=%-6d atom=%-5d E=%.6f  iters=%-4d  eig=%.5f  elapsed=%.1fs  attempts_so_far=%d\n",
+                            progress(), res.seed, res.kicked_atom,
                             res.final_energy, res.iteration, res.crit_eigenvalue,
                             elapsed, n_attempts
                         )
@@ -283,12 +308,12 @@ function run_batch()
                 else
                     if !MINIMAL_OUTPUT && n_attempts % 20 == 0
                         elapsed = round(time() - start_time, digits=1)
-                        println("  ...$n_attempts attempts tried so far, $(length(successes)) successes, " *
+                        println("  ...$(progress()) so far, " *
                                 "$guard_aborts guard aborts (degenerate-mode or second-eigenvalue), elapsed=$(elapsed)s")
                     end
                 end
 
-                if length(successes) >= TARGET_SUCCESSES
+                if done()
                     break
                 end
 
