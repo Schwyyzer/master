@@ -21,15 +21,25 @@ is still reported on its own, since that IS the quantity
 TARGET_SUCCESSES/TARGET_ATTEMPTS actually optimizes for.
 
 Usage:
-    python3 compare_runs.py "label1:path/to/results1.csv" "label2:path/to/results2.csv" ...
-
+    Edit RUNS below and just hit Run (Spyder/any IDE -- no command-line
+    args needed), or override via command-line args from a terminal:
+        python3 compare_runs.py "label1:path/to/results1.csv" "label2:path/to/results2.csv" ...
     A single CSV can skip the label:
-    python3 compare_runs.py path/to/results.csv
+        python3 compare_runs.py path/to/results.csv
 """
 import csv
 import os
 import statistics
 import sys
+
+# ============================================================
+# Settings -- edit these, or override via command-line args
+# ============================================================
+RUNS = [
+    # ("label shown in the output", "path/to/results.csv"),
+    # ("eps_0.1", "/path/to/run1/results.csv"),
+    # ("eps_nothing", "/path/to/run2/results.csv"),
+]
 
 
 def parse_bool(s):
@@ -169,19 +179,23 @@ def summarize(label, path):
 
 def main():
     args = sys.argv[1:]
-    if not args:
-        sys.exit('usage: python3 compare_runs.py "label:path/to/results.csv" [...] '
-                  '(a single bare path works too, with no label)')
 
-    runs = []
-    for spec in args:
-        if ":" in spec:
-            label, path = spec.split(":", 1)
-        elif len(args) == 1:
-            label, path = spec, spec
-        else:
-            sys.exit(f"expected label:path, got: {spec}")
-        runs.append((label, path))
+    if args:
+        runs = []
+        for spec in args:
+            if ":" in spec:
+                label, path = spec.split(":", 1)
+            elif len(args) == 1:
+                label, path = spec, spec
+            else:
+                sys.exit(f"expected label:path, got: {spec}")
+            runs.append((label, path))
+    else:
+        runs = RUNS
+
+    if not runs:
+        sys.exit("no runs given -- edit RUNS at the top of this file, or pass "
+                  '"label:path/to/results.csv" arguments on the command line')
 
     for label, path in runs:
         summarize(label, path)
