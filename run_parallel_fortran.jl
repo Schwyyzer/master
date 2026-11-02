@@ -129,6 +129,16 @@ LANCZOS_ITERATIONS = 10
 # top once DELTA_LM is validated at scale.
 TRUST_REGION_EPS = nothing
 
+# :single (default) is the plain Fortran-reference kick -- one random atom,
+# random direction, magnitude KICK_MAGNITUDE. :shear is a new, opt-in
+# alternative (phase 1 of a planned generalization, see
+# art_core_fortran.jl's run_art_attempt_fortran docstring): the atom
+# nearest the kicked one also gets displaced by KICK_MAGNITUDE, in the
+# OPPOSITE direction -- a local two-atom shear/dipole instead of a
+# single-atom monopole kick. results.csv records which atom that was
+# (shear_partner_atom column; blank under :single).
+KICK_MODE = :single
+
 OUTPUT_DIR = "//home//schwyyzer//Desktop//Master Thesis//parallel_art_fortran_run_$(Dates.format(now(), "yyyymmdd_HHMMSS"))"
 DUMP_DIR = joinpath(OUTPUT_DIR, "dumps")
 TRAJECTORY_DIR = joinpath(OUTPUT_DIR, "trajectories")
@@ -174,6 +184,7 @@ end
 @everywhere starting_fire_iterations = $STARTING_FIRE_ITERATIONS
 @everywhere lanczos_iterations = $LANCZOS_ITERATIONS
 @everywhere trust_region_eps = $TRUST_REGION_EPS
+@everywhere kick_mode = $KICK_MODE
 @everywhere begin
     data = parse_lammps_data(lammps_path)
     positions0 = hcat(data["x"], data["y"], data["z"])
@@ -205,6 +216,7 @@ end
             starting_fire_iterations = starting_fire_iterations,
             lanczos_iterations = lanczos_iterations,
             trust_region_eps = trust_region_eps,
+            kick_mode = kick_mode,
         )
     end
 end
@@ -244,9 +256,9 @@ function run_batch()
     log_io = MINIMAL_OUTPUT ? nothing : open(LOG_PATH, "w")
     if !MINIMAL_OUTPUT
         println(log_io,
-            "seed,success,kicked_atom,iterations,crit_eigenvalue,second_eigenvalue,converged,is_saddle," *
-            "force_magnitude,mep_proximity,initial_energy,final_energy,degenerate_mode_aborted," *
-            "second_eigenvalue_aborted,elapsed_time,dump_file,trajectory_file,error"
+            "seed,success,kicked_atom,shear_partner_atom,iterations,crit_eigenvalue,second_eigenvalue," *
+            "converged,is_saddle,force_magnitude,mep_proximity,initial_energy,final_energy," *
+            "degenerate_mode_aborted,second_eigenvalue_aborted,elapsed_time,dump_file,trajectory_file,error"
         )
         flush(log_io)
     end
@@ -276,10 +288,11 @@ function run_batch()
                     err_field = res.error === nothing ? "" : replace(res.error, "\n" => " | ", "," => ";")
                     dump_field = res.dump_file === nothing ? "" : res.dump_file
                     trajectory_field = res.trajectory_file === nothing ? "" : res.trajectory_file
+                    shear_partner_field = res.shear_partner_atom === nothing ? "" : res.shear_partner_atom
                     println(log_io,
-                        "$(res.seed),$(res.success),$(res.kicked_atom),$(res.iteration),$(res.crit_eigenvalue)," *
-                        "$(res.second_eigenvalue),$(res.converged),$(res.is_saddle),$(res.force_magnitude)," *
-                        "$(res.mep_proximity),$(res.initial_energy),$(res.final_energy)," *
+                        "$(res.seed),$(res.success),$(res.kicked_atom),$shear_partner_field,$(res.iteration)," *
+                        "$(res.crit_eigenvalue),$(res.second_eigenvalue),$(res.converged),$(res.is_saddle)," *
+                        "$(res.force_magnitude),$(res.mep_proximity),$(res.initial_energy),$(res.final_energy)," *
                         "$(res.degenerate_mode_aborted),$(res.second_eigenvalue_aborted),$(res.elapsed_time)," *
                         "$dump_field,$trajectory_field,$err_field"
                     )
@@ -423,6 +436,7 @@ function print_minimal_summary(successes, positions0)
     println("max_zero_eigenvalue_threshold_number = $MAX_ZERO_EIGENVALUE_THRESHOLD_NUMBER")
     println("max_consecutive_second_eig_negative = $MAX_CONSECUTIVE_SECOND_EIG_NEGATIVE")
     println("kick_magnitude = $KICK_MAGNITUDE")
+    println("kick_mode = $KICK_MODE")
     println("starting_fire_iterations = $STARTING_FIRE_ITERATIONS")
     println("lanczos_iterations = $LANCZOS_ITERATIONS")
     println("max_iterations = $MAX_ITERATIONS")

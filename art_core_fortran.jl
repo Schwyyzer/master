@@ -14,8 +14,11 @@ art_core_no_tracking.jl's phase1/phase2 design):
     [1.0, 1.0] before calling build_hessian_fast (see run_parallel_fortran.jl)
     so that function reduces to a plain, non-mass-weighted Hessian.
   - NO initial relaxation before the first Hessian/eigenvector calc.
-  - Kick: a single atom (uniform over 1:natoms), magnitude 0.15, direction
-    = normalize(uniform cube sample in [-0.5,0.5]^3).
+  - Kick: by default (`kick_mode=:single`) a single atom (uniform over
+    1:natoms), magnitude 0.15, direction = normalize(uniform cube sample
+    in [-0.5,0.5]^3) -- this part is unchanged from the plain Fortran
+    port. `kick_mode=:shear` is a NEW, opt-in alternative (not in the
+    Fortran reference): see run_art_attempt_fortran's docstring.
   - A STATIC neighbor list (skin = rc+1.0), built once from the starting
     minimum and reused for the entire run, relying on
     force/compute_energy/build_hessian_fast to filter every pair to r<=rc
@@ -98,6 +101,7 @@ if !isdefined(@__MODULE__, :FortranAttemptResult)
         seed::Int
         kicked_atom::Int
         kick_dir::Vector{Float64}
+        shear_partner_atom::Union{Int,Nothing} = nothing
         initial_energy::Float64
         final_energy::Float64 = NaN
         crit_eigenvalue::Float64 = NaN
@@ -126,13 +130,15 @@ end
 # and immediately here (at include-time) instead of letting it surface
 # later as a confusing `FieldError: no field trajectory_file` deep inside
 # run_batch(), after real compute has already happened.
-if !(:trajectory_file in fieldnames(FortranAttemptResult)) || !(:elapsed_time in fieldnames(FortranAttemptResult))
+if !(:trajectory_file in fieldnames(FortranAttemptResult)) || !(:elapsed_time in fieldnames(FortranAttemptResult)) ||
+   !(:shear_partner_atom in fieldnames(FortranAttemptResult))
     error(
         "FortranAttemptResult is already defined in this Julia process from an earlier run, and is " *
-        "missing fields this version of art_core_fortran.jl expects (trajectory_file/elapsed_time). " *
-        "Julia cannot hot-reload a changed struct definition into an already-running process -- " *
-        "re-running or re-including this script in the SAME session/REPL (with workers still alive) " *
-        "will not pick up the change. Fully exit Julia and start a fresh process before running again."
+        "missing fields this version of art_core_fortran.jl expects (trajectory_file/elapsed_time/" *
+        "shear_partner_atom). Julia cannot hot-reload a changed struct definition into an already-" *
+        "running process -- re-running or re-including this script in the SAME session/REPL (with " *
+        "workers still alive) will not pick up the change. Fully exit Julia and start a fresh process " *
+        "before running again."
     )
 end
 
@@ -163,6 +169,39 @@ function write_trajectory_csv(path, step_norms)
             println(io, "$i,$s")
         end
     end
+end
+
+"""
+    nearest_atom(positions, box, i)
+
+Index of the atom (other than `i`) closest to atom `i`, by periodic
+minimum-image distance (same per-component `dx -= box[k]*round(dx/box[k])`
+convention as `force!`/`compute_energy` in Version1.1.jl). A brute-force
+O(natoms) scan over every other atom -- called once per attempt (to pick
+the shear-kick partner, see `kick_mode` below), not once per iteration
+like force!/build_hessian_fast, so this isn't a hot path and doesn't need
+the static neighbor list's own candidate pruning.
+"""
+function nearest_atom(positions, box, i)
+    natoms = size(positions, 1)
+    xi = positions[i, 1]; yi = positions[i, 2]; zi = positions[i, 3]
+    best_j = 0
+    best_r2 = Inf
+    for j in 1:natoms
+        j == i && continue
+        dx = xi - positions[j, 1]
+        dy = yi - positions[j, 2]
+        dz = zi - positions[j, 3]
+        dx -= box[1] * round(dx / box[1])
+        dy -= box[2] * round(dy / box[2])
+        dz -= box[3] * round(dz / box[3])
+        r2 = dx*dx + dy*dy + dz*dz
+        if r2 < best_r2
+            best_r2 = r2
+            best_j = j
+        end
+    end
+    return best_j
 end
 
 """
@@ -350,6 +389,24 @@ history for the fuller derivation.
 from the starting minimum and shared across every attempt (see
 run_parallel_fortran.jl); it is never rebuilt here.
 
+`kick_mode`: `:single` (default) is the plain Fortran-reference kick
+described in this file's header. `:shear` is a new, opt-in alternative,
+phase 1 of a planned generalization: the atom nearest `kicked_atom`
+(periodic minimum image, see `nearest_atom`) is displaced by the SAME
+`kick_magnitude`, in the OPPOSITE direction -- a local two-atom shear/
+dipole perturbation instead of a single-atom monopole one. Both the
+original kick's direction/atom selection and the partner-finding are
+otherwise unchanged (same `rng`-driven atom/direction, same
+`kick_magnitude` per atom). Planned next step (not yet implemented):
+generalize from one atom per side to a selected region split into two
+halves pushed in opposite directions, weighted toward the center of each
+half (a gradient, atoms near the split plane moving least) -- this
+two-atom version is the minimal case of that same idea. `kicked_atom`/
+`kick_dir` (the original, :single-compatible fields) and the new
+`shear_partner_atom` (the second atom, `nothing` under `:single`) are
+both recorded on every return, so `:shear` runs stay analyzable with the
+same tooling (results.csv, validate_saddles.py, etc.) as :single ones.
+
 Keyword defaults: eigenvalue_threshold=3.0, delta_x_max=0.125,
 delta_lm=0.025, force_tolerance=1e-3, zero_eigenvalue_threshold=0.1,
 max_zero_eigenvalue_threshold_number=10, kick_magnitude=0.15,
@@ -406,8 +463,13 @@ function run_art_attempt_fortran(
     starting_fire_iterations::Int = 5,
     lanczos_iterations::Int = 10,
     trust_region_eps::Union{Float64,Nothing} = nothing,
+    kick_mode::Symbol = :single,
 )
     t_start = time()   # whole-attempt wall-clock; read at every return below
+
+    kick_mode in (:single, :shear) || error(
+        "kick_mode must be :single or :shear, got :$kick_mode"
+    )
 
     rng = MersenneTwister(seed)
     natoms = data["natoms"]
@@ -418,6 +480,15 @@ function run_art_attempt_fortran(
     kick_dir = rand(rng, 3) .- 0.5
     kick_dir ./= norm(kick_dir)
 
+    # Shear kick (phase 1 of a planned generalization -- see this
+    # function's docstring): the atom nearest `kicked_atom` (periodic
+    # minimum image, found from the UNPERTURBED starting minimum, before
+    # either atom has moved) gets displaced by the same kick_magnitude,
+    # in the OPPOSITE direction -- a local two-atom shear/dipole instead
+    # of a single-atom monopole kick. Computed once here (not inside the
+    # try block) since it doesn't depend on anything the try block sets up.
+    shear_partner_atom = kick_mode == :shear ? nearest_atom(positions0, box, kicked_atom) : nothing
+
     iteration = 0
 
     try
@@ -426,6 +497,19 @@ function run_art_attempt_fortran(
         evec[3*(kicked_atom-1)+2] = kick_dir[2]
         evec[3*(kicked_atom-1)+3] = kick_dir[3]
 
+        if shear_partner_atom !== nothing
+            evec[3*(shear_partner_atom-1)+1] = -kick_dir[1]
+            evec[3*(shear_partner_atom-1)+2] = -kick_dir[2]
+            evec[3*(shear_partner_atom-1)+3] = -kick_dir[3]
+        end
+
+        # kick_magnitude applies PER PARTICIPATING ATOM, not to evec as a
+        # whole: each nonzero 3-component block of evec is independently
+        # unit-norm (kick_dir / -kick_dir), so `kick_magnitude .* evec`
+        # displaces EVERY participating atom by exactly kick_magnitude,
+        # regardless of how many atoms are involved -- a shear kick isn't
+        # a weaker version of a single kick, each atom moves the same
+        # distance a lone kick would have moved it.
         positions = positions0 .+ kick_magnitude .* flat_to_matrix(evec)
 
         H = build_hessian_fast(positions, data, pairs_static)
@@ -476,7 +560,7 @@ function run_art_attempt_fortran(
                         write_trajectory_csv(trajectory_file, step_norms)
                     end
                     return FortranAttemptResult(;
-                        success=false, seed, kicked_atom, kick_dir, initial_energy,
+                        success=false, seed, kicked_atom, kick_dir, shear_partner_atom, initial_energy,
                         final_energy=energy, crit_eigenvalue=lowest_eval, second_eigenvalue=second_eval,
                         force_magnitude=force_mag, mep_proximity=mep_proximity_min,
                         iteration, degenerate_mode_aborted=true,
@@ -497,7 +581,7 @@ function run_art_attempt_fortran(
                         write_trajectory_csv(trajectory_file, step_norms)
                     end
                     return FortranAttemptResult(;
-                        success=false, seed, kicked_atom, kick_dir, initial_energy,
+                        success=false, seed, kicked_atom, kick_dir, shear_partner_atom, initial_energy,
                         final_energy=energy, crit_eigenvalue=lowest_eval, second_eigenvalue=second_eval,
                         force_magnitude=force_mag, mep_proximity=mep_proximity_min,
                         iteration, second_eigenvalue_aborted=true,
@@ -574,7 +658,7 @@ function run_art_attempt_fortran(
         end
 
         return FortranAttemptResult(;
-            success, seed, kicked_atom, kick_dir, initial_energy,
+            success, seed, kicked_atom, kick_dir, shear_partner_atom, initial_energy,
             final_energy=energy, crit_eigenvalue=lowest_eval, second_eigenvalue=second_eval,
             force_magnitude=force_mag, mep_proximity=mep_proximity_min,
             iteration, converged, is_saddle,
@@ -585,7 +669,7 @@ function run_art_attempt_fortran(
 
     catch e
         return FortranAttemptResult(;
-            success=false, seed, kicked_atom, kick_dir, initial_energy,
+            success=false, seed, kicked_atom, kick_dir, shear_partner_atom, initial_energy,
             iteration, elapsed_time=time() - t_start,
             error="[iteration=$(iteration)] " * sprint(showerror, e),
         )
