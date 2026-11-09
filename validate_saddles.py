@@ -12,7 +12,7 @@ This is the standard check for a genuine first-order saddle: it should
 connect exactly two basins, one on each side of the unstable direction.
 
 Physics (parse_lammps_data / force / compute_energy / relax) is copied
-verbatim from art_driver.py, already cross-checked against the Julia
+verbatim from legacy/art_driver.py, already cross-checked against the Julia
 implementation earlier in this project. Config constants below (RC,
 EPSILON_TABLE, SIGMA_TABLE) default to match this repo's CURRENT
 config.jl -- NOT necessarily what actually produced your CSV, since
@@ -118,10 +118,10 @@ ACTIVE_FRACTION = 0.2      # an atom counts as "active" if its pos_plus/pos_minu
 
 
 # =====================================================================
-# Physics -- copied verbatim from art_driver.py (already validated
+# Physics -- copied verbatim from legacy/art_driver.py (already validated
 # against the Julia implementation), just reading RC/EPSILON_TABLE/
 # SIGMA_TABLE/RELAXATION_STEP_MAGNITUDE from this module's globals above
-# instead of art_driver.py's own hardcoded ones.
+# instead of legacy/art_driver.py's own hardcoded ones.
 # =====================================================================
 def parse_lammps_data(path):
     with open(path, "r") as f:
@@ -216,7 +216,7 @@ def compute_energy(coords, types, box, pairs):
     energy = 4 * eps * (inv_r6**2 - inv_r6)
     # Shift by V(rc) so energy vanishes continuously at the cutoff --
     # matches Version1.1.jl's compute_energy (and the validated
-    # art_driver.py port). Without this, every absolute energy computed
+    # legacy/art_driver.py port). Without this, every absolute energy computed
     # here was systematically offset from results.csv's own values (by
     # an amount proportional to how many pairs are within cutoff), which
     # is exactly what made the "computed initial_energy doesn't match

@@ -36,10 +36,10 @@ in seconds. Three tests:
 Each test prints PASS/FAIL plus the numbers behind the verdict.
 =#
 
-include("config.jl")
-include("lammps_and_document.jl")   # defines SimData, used below
-include("neighbor_pairs.jl")
-include("Hessian.jl")
+include("../config.jl")
+include("../lammps_and_document.jl")   # defines SimData, used below
+include("../neighbor_pairs.jl")
+include("../Hessian.jl")
 include("eigenvalueDecomp.jl")   # old, buggy track_mode -- for contrast
 include("mode_tracking.jl")      # new track_modes / track_mode
 

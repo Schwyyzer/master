@@ -67,9 +67,9 @@ if nprocs() == 1
 end
 
 @everywhere begin
-    include("Version1.1.jl")   # defines force/compute_energy/perpendicular_forces
+    include("../Version1.1.jl")   # defines force/compute_energy/perpendicular_forces
                                 # and loads config.jl, neighbor_pairs.jl, Hessian.jl,
-                                # particle_movement.jl, eigenvalueDecomp.jl
+                                # particle_movement.jl
     include("art_core.jl")     # defines run_art_attempt / AttemptResult
     using LinearAlgebra
     BLAS.set_num_threads(1)    # one attempt per process at a time -- avoid

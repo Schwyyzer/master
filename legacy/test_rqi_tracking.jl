@@ -48,10 +48,10 @@ itself is broken.
 Run with: julia test_rqi_tracking.jl
 =#
 
-include("config.jl")
-include("lammps_and_document.jl")   # defines SimData, used below
-include("neighbor_pairs.jl")
-include("Hessian.jl")
+include("../config.jl")
+include("../lammps_and_document.jl")   # defines SimData, used below
+include("../neighbor_pairs.jl")
+include("../Hessian.jl")
 include("rqi_tracking.jl")
 
 using LinearAlgebra

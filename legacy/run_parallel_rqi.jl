@@ -5,24 +5,25 @@ have been found, then report: a diversity summary, any failed attempts
 that overshot into a different minimum on unconstrained relax, and the
 barrier energy of every saddle point found.
 
-This is the NO-MODE-TRACKING variant: phase 2 uses the original cold
-full re-diagonalization every iteration (art_core_no_tracking.jl /
-calculate_moves), i.e. the version that gave 10/10 then 50/50 successes
-on the real system, plus the overshoot-relax check and barrier-energy
-summary that were added alongside mode tracking but don't depend on it.
-Mode tracking is set aside for now (see art_core.jl / mode_tracking.jl /
-rqi_tracking.jl to revisit it later).
+This is the RQI variant: phase 2 uses the cheap single-vector tracker
+in rqi_tracking.jl / art_core_rqi.jl (one preconditioned correction
+step per iteration, angle-capped with automatic fallback to a full
+diagonalization) instead of a cold full re-diagonalization every
+iteration -- built on top of the validated 10/10-then-50/50 baseline
+(art_core_no_tracking.jl), keeping its overshoot-relax check and
+barrier-energy summary.
 
-Phase 2's step size is now ADAPTIVE: proportional to the force parallel
-to the move direction, large early in phase 2 (steep, just-destabilized
-landscape) and shrinking toward the old fixed move_phase2_modifier
-(now the floor) as that parallel force vanishes approaching the saddle
--- capped at MAX_PHASE2_STEP below. See art_core_no_tracking.jl's
-run_art_attempt docstring for the exact calibration. First test: floor
-unchanged, ceiling set to 5x it -- watch phase2_step_size_min/max in
-the CSV to see the actual taper, and max_phase2_angle_deg in case
-bigger early steps reintroduce mode-jump problems the fixed small step
-didn't have.
+BEFORE TRUSTING THIS AT SCALE: check your existing 50/50 run's
+results.csv for the actual max_phase2_angle_deg distribution and set
+MAX_ANGLE_DEG below to something comfortably above the typical value
+(a few times the ~1-2 degrees you were expecting) -- that's the
+guardrail this whole approach leans on. Also watch the new
+n_full_rechecks column: near-zero (beyond the periodic
+MODE_RECHECK_EVERY ticks) confirms the small-angle assumption holds
+and this is running close to its theoretical best; a high count means
+the guardrail is doing real work and the speedup will be smaller than
+hoped, but results should still be correct either way -- that's the
+whole point of the fallback.
 
 WHY SEPARATE PROCESSES AND NOT Threads.@threads:
 Phase 1/2 both diagonalize the Hessian through Arpack.jl, which wraps the
@@ -61,25 +62,16 @@ MAX_TOTAL_ITER = 2000                     # shared phase1+phase2 budget, matches
                                            # new_start_1_1_1.py's `iteration<2000`
                                            # (Version1.1.jl used 1000; phase 1 had
                                            # no cap at all in either language)
-MODE_RECHECK_EVERY = 25                   # unused by this variant, kept for
-                                           # signature compatibility with art_core.jl
-MAX_PHASE2_STEP_MULTIPLIER = 5.0          # ceiling on the adaptive phase-2 step size,
-                                           # as a multiple of move_phase2_modifier (the
-                                           # floor, unchanged from before this change).
-                                           # First test per the user's request: 5x.
-                                           # (Actual MAX_PHASE2_STEP is computed below,
-                                           # once config.jl -- and so move_phase2_modifier
-                                           # -- has actually been loaded.)
-SADDLE_EIGENVALUE_TOLERANCE = 0.01        # success requires crit_eigenvalue < this, not
-                                           # strictly < 0 -- on a smoothly-converging search
-                                           # the discrete phase-2 loop routinely overshoots
-                                           # the true zero-crossing by a small amount on its
-                                           # last step (observed: +0.0004 to +0.006), which
-                                           # a strict < 0 check wrongly rejects as failure
-                                           # despite being a genuinely converged saddle. This
-                                           # is a small POSITIVE tolerance, not a magnitude
-                                           # check -- it still accepts every case the old
-                                           # check did (any negative value, however large).
+MODE_RECHECK_EVERY = 25                   # phase-2 tracked-mode full-diagonalization
+                                           # safety check cadence (periodic, independent
+                                           # of the per-step guardrail below)
+MAX_ANGLE_DEG = 10.0                      # per-step guardrail: if a single RQI
+                                           # correction wants to rotate more than this,
+                                           # don't trust it -- fall back to a full
+                                           # diagonalization for that iteration instead.
+                                           # Set from your own logged max_phase2_angle_deg
+                                           # data (see file header); this default is a
+                                           # generous multiple of the ~1-2 degrees expected.
 
 OUTPUT_DIR = "//home//schwyyzer//Desktop//Master Thesis//parallel_art_run_$(Dates.format(now(), "yyyymmdd_HHMMSS"))"
 DUMP_DIR = joinpath(OUTPUT_DIR, "dumps")
@@ -95,26 +87,22 @@ if nprocs() == 1
 end
 
 @everywhere begin
-    include("Version1.1.jl")   # defines force/compute_energy/perpendicular_forces
+    include("../Version1.1.jl")   # defines force/compute_energy/perpendicular_forces
                                 # and loads config.jl, neighbor_pairs.jl, Hessian.jl,
-                                # particle_movement.jl, eigenvalueDecomp.jl
-    include("art_core_no_tracking.jl")  # defines run_art_attempt / AttemptResult
-                                # (cold full re-diagonalization phase 2,
-                                # no mode tracking -- see file header)
+                                # particle_movement.jl
+    include("art_core_rqi.jl")  # defines run_art_attempt / AttemptResult
+                                # (cheap single-vector RQI-tracked phase 2,
+                                # angle-capped with full-diagonalization
+                                # fallback -- see file header)
     using LinearAlgebra
     BLAS.set_num_threads(1)    # one attempt per process at a time -- avoid
                                 # every worker independently oversubscribing BLAS
 end
 
-MAX_PHASE2_STEP = MAX_PHASE2_STEP_MULTIPLIER * move_phase2_modifier
-println("phase-2 adaptive step size: floor=$move_phase2_modifier  ceiling=$MAX_PHASE2_STEP " *
-        "($(MAX_PHASE2_STEP_MULTIPLIER)x)")
-
 @everywhere lammps_path = $LAMMPS_PATH
 @everywhere max_total_iter = $MAX_TOTAL_ITER
 @everywhere mode_recheck_every = $MODE_RECHECK_EVERY
-@everywhere max_phase2_step = $MAX_PHASE2_STEP
-@everywhere saddle_eigenvalue_tolerance = $SADDLE_EIGENVALUE_TOLERANCE
+@everywhere max_angle_deg = $MAX_ANGLE_DEG
 @everywhere begin
     data = parse_lammps_data(lammps_path)
     positions0 = hcat(data["x"], data["y"], data["z"])
@@ -131,8 +119,7 @@ println("phase-2 adaptive step size: floor=$move_phase2_modifier  ceiling=$MAX_P
             dump_file = dump_path,
             max_total_iter = max_total_iter,
             mode_recheck_every = mode_recheck_every,
-            max_phase2_step = max_phase2_step,
-            saddle_eigenvalue_tolerance = saddle_eigenvalue_tolerance,
+            max_angle_deg = max_angle_deg,
         )
     end
 end
@@ -179,8 +166,7 @@ function run_batch()
     log_io = open(LOG_PATH, "w")
     println(log_io,
         "seed,success,kicked_atom,phase1_iters,total_iters,crit_eigenvalue,initial_energy," *
-        "final_energy,max_phase2_angle_deg,phase2_step_size_min,phase2_step_size_max," *
-        "overshoot_energy,overshoot_new_minimum,dump_file,error"
+        "final_energy,max_phase2_angle_deg,n_full_rechecks,overshoot_energy,overshoot_new_minimum,dump_file,error"
     )
     flush(log_io)
 
@@ -211,27 +197,27 @@ function run_batch()
                 err_field = res.error === nothing ? "" : replace(res.error, "\n" => " | ", "," => ";")
                 dump_field = res.dump_file === nothing ? "" : res.dump_file
                 angle_field = res.max_phase2_angle_deg === nothing ? "" : round(res.max_phase2_angle_deg, digits=2)
-                step_min_field = res.phase2_step_size_min === nothing ? "" : res.phase2_step_size_min
-                step_max_field = res.phase2_step_size_max === nothing ? "" : res.phase2_step_size_max
+                recheck_field = res.n_full_rechecks === nothing ? "" : res.n_full_rechecks
                 ov_e_field = res.overshoot_energy === nothing ? "" : res.overshoot_energy
                 ov_new_field = res.overshoot_new_minimum === nothing ? "" : res.overshoot_new_minimum
                 println(log_io,
                     "$(res.seed),$(res.success),$(res.kicked_atom),$(res.steps_part1),$(res.iteration)," *
-                    "$(res.crit_eigenvalue),$(res.initial_energy),$(res.final_energy),$angle_field," *
-                    "$step_min_field,$step_max_field,$ov_e_field,$ov_new_field,$dump_field,$err_field"
+                    "$(res.crit_eigenvalue),$(res.initial_energy),$(res.final_energy),$angle_field,$recheck_field," *
+                    "$ov_e_field,$ov_new_field,$dump_field,$err_field"
                 )
                 flush(log_io)
 
                 if res.success
                     push!(successes, res)
                     elapsed = round(time() - start_time, digits=1)
+                    n_phase2 = res.iteration - res.steps_part1
+                    recheck_pct = n_phase2 > 0 ? round(100 * something(res.n_full_rechecks, 0) / n_phase2, digits=1) : 0.0
                     @printf(
-                        "[%2d/%2d] SUCCESS  seed=%-6d atom=%-5d E=%.6f  iters=%-4d (phase1=%-4d)  max_angle=%.1f°  step=[%.5f,%.5f]  elapsed=%.1fs  attempts_so_far=%d\n",
+                        "[%2d/%2d] SUCCESS  seed=%-6d atom=%-5d E=%.6f  iters=%-4d (phase1=%-4d)  max_angle=%.1f°  full_rechecks=%d/%d (%.1f%%)  elapsed=%.1fs  attempts_so_far=%d\n",
                         length(successes), TARGET_SUCCESSES, res.seed, res.kicked_atom,
                         res.final_energy, res.iteration, res.steps_part1,
-                        something(res.max_phase2_angle_deg, NaN),
-                        something(res.phase2_step_size_min, NaN), something(res.phase2_step_size_max, NaN),
-                        elapsed, n_attempts
+                        something(res.max_phase2_angle_deg, NaN), something(res.n_full_rechecks, 0), n_phase2,
+                        recheck_pct, elapsed, n_attempts
                     )
                 else
                     if res.overshoot_new_minimum == true

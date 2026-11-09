@@ -77,10 +77,10 @@ using Printf
 # ============================================================
 RESULTS_CSV = "results.csv"
 LAMMPS_PATH = "FILL_ME_IN"   # the EXACT LAMMPS_PATH value the run_parallel*.jl
-                              # settings block used to PRODUCE this specific CSV --
-                              # not necessarily config.jl's inpath2 or this run_
-                              # parallel*.jl's current default, if either changed
-                              # since. Getting this wrong won't obviously error
+                              # settings block (experiment_settings.jl, for the
+                              # active pipeline) used to PRODUCE this specific
+                              # CSV -- not necessarily that file's current
+                              # default, if it changed since. Getting this wrong won't obviously error
                               # (same atom count/types is plausible even from the
                               # wrong file) -- it'll just silently validate against
                               # the wrong starting minimum, so this is deliberately
