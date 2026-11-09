@@ -108,7 +108,7 @@ end
 @everywhere starting_fire_iterations = $STARTING_FIRE_ITERATIONS
 @everywhere lanczos_iterations = $LANCZOS_ITERATIONS
 @everywhere trust_region_eps = $TRUST_REGION_EPS
-@everywhere kick_mode = $KICK_MODE
+@everywhere kick_mode = $(QuoteNode(KICK_MODE))
 @everywhere begin
     data = parse_lammps_data(lammps_path)
     positions0 = hcat(data["x"], data["y"], data["z"])
