@@ -86,3 +86,17 @@ TRUST_REGION_EPS = nothing
 # single-atom monopole kick. results.csv records which atom that was
 # (shear_partner_atom column; blank under :single).
 KICK_MODE = :single
+
+# false (default, unchanged behavior): during the destabilization/"phase 1"
+# branch (before the tracked eigenvalue first drops below
+# -EIGENVALUE_THRESHOLD), both the FIRE relaxation and the DELTA_LM push
+# use the FRESHLY re-tracked eigenvector every iteration -- only the push
+# MAGNITUDE is fixed, not its direction. Set true to additionally freeze
+# the DIRECTION to whatever it was on the first iteration (the kick
+# direction, refined once) for as long as the search stays in that
+# branch -- a straight-line push instead of a re-aimed one, testing
+# whether re-tracking the direction during phase 1 is actually buying
+# anything over fixing it too, now that the step size is already fixed.
+# Guards and the branch decision itself are unaffected either way (see
+# art_core_fortran.jl's run_art_attempt_fortran docstring).
+FREEZE_PUSH_DIRECTION = false

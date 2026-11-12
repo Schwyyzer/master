@@ -407,6 +407,26 @@ two-atom version is the minimal case of that same idea. `kicked_atom`/
 both recorded on every return, so `:shear` runs stay analyzable with the
 same tooling (results.csv, validate_saddles.py, etc.) as :single ones.
 
+`freeze_push_direction` (default false, i.e. unchanged behavior): while
+`lowest_eval >= -eigenvalue_threshold` (the destabilization/"phase 1"
+branch below), both the FIRE perpendicular-relaxation restriction vector
+and the `delta_lm` push itself normally use the FRESHLY re-tracked `evec`
+every iteration -- only the push's MAGNITUDE (`delta_lm`) is fixed, not
+its direction. Setting this true additionally freezes the DIRECTION to
+whatever `evec` was on the very first iteration (the kick direction,
+Lanczos-refined once before the loop) for as long as the search stays in
+that branch; `lowest_eval`/`second_eval` are still recomputed every
+iteration exactly as before (via the same live Lanczos tracking) and
+still drive the guards and the branch decision itself -- only WHICH
+vector gets pushed along is affected. The first iteration that reaches
+the Newton branch (`lowest_eval < -eigenvalue_threshold`) latches this
+off permanently for the rest of the attempt, reverting to the live-
+tracked `evec` for good -- this only ever touches the destabilization
+phase, matching the original phase1(fixed direction)/phase2 question
+this option exists to test: is re-tracking the direction during phase 1
+actually buying anything over a single straight-line push, now that the
+magnitude is fixed either way?
+
 Keyword defaults: eigenvalue_threshold=3.0, delta_x_max=0.125,
 delta_lm=0.025, force_tolerance=1e-3, zero_eigenvalue_threshold=0.1,
 max_zero_eigenvalue_threshold_number=10, kick_magnitude=0.15,
@@ -464,6 +484,7 @@ function run_art_attempt_fortran(
     lanczos_iterations::Int = 10,
     trust_region_eps::Union{Float64,Nothing} = nothing,
     kick_mode::Symbol = :single,
+    freeze_push_direction::Bool = false,
 )
     t_start = time()   # whole-attempt wall-clock; read at every return below
 
@@ -515,6 +536,13 @@ function run_art_attempt_fortran(
         H = build_hessian_fast(positions, data, pairs_static)
         lowest_eval, second_eval, evec = lanczos_lowest_eigenvalues(H, evec; n_iter=lanczos_iterations)
 
+        # See freeze_push_direction's docstring above. Captured
+        # unconditionally (cheap: one length-3natoms copy, once per
+        # attempt) so the branch below doesn't need an extra isdefined
+        # check; only read when freeze_push_direction is actually true.
+        frozen_push_evec = copy(evec)
+        in_push_phase = true
+
         n_fire = starting_fire_iterations
         zero_eig_count = 0
         second_eig_neg_count = 0
@@ -533,7 +561,8 @@ function run_art_attempt_fortran(
         while !converged
             iteration += 1
 
-            positions = relax_positions_fire(positions, data, pairs_static, flat_to_matrix(evec), n_fire, box)
+            fire_restriction = (freeze_push_direction && in_push_phase) ? frozen_push_evec : evec
+            positions = relax_positions_fire(positions, data, pairs_static, flat_to_matrix(fire_restriction), n_fire, box)
 
             H = build_hessian_fast(positions, data, pairs_static)
             lowest_eval, second_eval, evec = lanczos_lowest_eigenvalues(H, evec; n_iter=lanczos_iterations)
@@ -597,6 +626,7 @@ function run_art_attempt_fortran(
 
             evec_matrix = flat_to_matrix(evec)
             if lowest_eval < -eigenvalue_threshold
+                in_push_phase = false   # latch off for good: Newton branch always uses live evec
                 delta_x = dot(h_flat, evec) / lowest_eval
 
                 if trust_region_eps === nothing
@@ -627,8 +657,9 @@ function run_art_attempt_fortran(
                 positions = positions .+ delta_x .* evec_matrix
             else
                 n_fire = starting_fire_iterations
+                push_vector = (freeze_push_direction && in_push_phase) ? flat_to_matrix(frozen_push_evec) : evec_matrix
                 push!(step_norms, delta_lm)
-                positions = positions .+ delta_lm .* evec_matrix
+                positions = positions .+ delta_lm .* push_vector
             end
 
             if force_mag < force_tolerance

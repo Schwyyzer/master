@@ -109,6 +109,7 @@ end
 @everywhere lanczos_iterations = $LANCZOS_ITERATIONS
 @everywhere trust_region_eps = $TRUST_REGION_EPS
 @everywhere kick_mode = $(QuoteNode(KICK_MODE))
+@everywhere freeze_push_direction = $FREEZE_PUSH_DIRECTION
 @everywhere begin
     data = parse_lammps_data(lammps_path)
     positions0 = hcat(data["x"], data["y"], data["z"])
@@ -141,6 +142,7 @@ end
             lanczos_iterations = lanczos_iterations,
             trust_region_eps = trust_region_eps,
             kick_mode = kick_mode,
+            freeze_push_direction = freeze_push_direction,
         )
     end
 end
@@ -361,6 +363,7 @@ function print_minimal_summary(successes, positions0)
     println("max_consecutive_second_eig_negative = $MAX_CONSECUTIVE_SECOND_EIG_NEGATIVE")
     println("kick_magnitude = $KICK_MAGNITUDE")
     println("kick_mode = $KICK_MODE")
+    println("freeze_push_direction = $FREEZE_PUSH_DIRECTION")
     println("starting_fire_iterations = $STARTING_FIRE_ITERATIONS")
     println("lanczos_iterations = $LANCZOS_ITERATIONS")
     println("max_iterations = $MAX_ITERATIONS")
