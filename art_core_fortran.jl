@@ -427,6 +427,27 @@ this option exists to test: is re-tracking the direction during phase 1
 actually buying anything over a single straight-line push, now that the
 magnitude is fixed either way?
 
+`newton_step_mode` (default `:formula`, i.e. unchanged behavior): once in
+the Newton branch (`lowest_eval < -eigenvalue_threshold`), `:formula` is
+everything described above (`delta_x = dot(h_flat,evec)/lowest_eval`,
+clamped by `delta_x_max` or the trust-region cap). `:fixed_overshoot` is a
+different, non-curvature-based alternative for comparing against
+`trust_region_eps` on more equal footing -- a constant step size, direction
+still the live-tracked `evec` same as `:formula`, starting at
+`newton_fixed_step_fraction * delta_lm` (so "10% of phase 1"'s step size,
+at the default) the first iteration the Newton branch is reached, and never
+recomputed from force/curvature afterward. It only ever shrinks: each
+subsequent iteration, if the angle between this iteration's `evec` and the
+PREVIOUS iteration's `evec` (both already sign-corrected above to point
+the same consistent way) is at least `overshoot_angle_deg` (default 150,
+i.e. "close to 180") -- the tracked direction having reversed being this
+scheme's proxy for "we stepped past the stationary point along it" -- the
+step size is multiplied by `overshoot_shrink_factor` (default 0.5). There
+is deliberately no corresponding growth rule. `trust_region_eps`/
+`delta_x_max` are not read in this mode; `n_fire` still escalates the same
+way `:formula`'s unclamped case does, so FIRE relaxation effort stays
+comparable between the two modes.
+
 Keyword defaults: eigenvalue_threshold=3.0, delta_x_max=0.125,
 delta_lm=0.025, force_tolerance=1e-3, zero_eigenvalue_threshold=0.1,
 max_zero_eigenvalue_threshold_number=10, kick_magnitude=0.15,
@@ -485,11 +506,18 @@ function run_art_attempt_fortran(
     trust_region_eps::Union{Float64,Nothing} = nothing,
     kick_mode::Symbol = :single,
     freeze_push_direction::Bool = false,
+    newton_step_mode::Symbol = :formula,
+    newton_fixed_step_fraction::Float64 = 0.1,
+    overshoot_angle_deg::Float64 = 150.0,
+    overshoot_shrink_factor::Float64 = 0.5,
 )
     t_start = time()   # whole-attempt wall-clock; read at every return below
 
     kick_mode in (:single, :shear) || error(
         "kick_mode must be :single or :shear, got :$kick_mode"
+    )
+    newton_step_mode in (:formula, :fixed_overshoot) || error(
+        "newton_step_mode must be :formula or :fixed_overshoot, got :$newton_step_mode"
     )
 
     rng = MersenneTwister(seed)
@@ -542,6 +570,14 @@ function run_art_attempt_fortran(
         # check; only read when freeze_push_direction is actually true.
         frozen_push_evec = copy(evec)
         in_push_phase = true
+
+        # See newton_step_mode's docstring above; both unused under
+        # :formula. NaN is a "not yet initialized" sentinel for
+        # newton_fixed_step (set on first entry to the Newton branch,
+        # then only ever shrunk) -- distinct from 0.0, which a shrink
+        # could plausibly underflow to over many iterations.
+        newton_fixed_step = NaN
+        prev_newton_evec = nothing
 
         n_fire = starting_fire_iterations
         zero_eig_count = 0
@@ -627,32 +663,46 @@ function run_art_attempt_fortran(
             evec_matrix = flat_to_matrix(evec)
             if lowest_eval < -eigenvalue_threshold
                 in_push_phase = false   # latch off for good: Newton branch always uses live evec
-                delta_x = dot(h_flat, evec) / lowest_eval
 
-                if trust_region_eps === nothing
-                    # matches the reference literally: clamps the MAGNITUDE to
-                    # delta_x_max without preserving delta_x's sign. Harmless in
-                    # practice -- the sign-alignment above guarantees
-                    # dot(F,evec)<=0 and lowest_eval<0 here, so delta_x is
-                    # always >=0 already, and the clamp is a no-op on sign.
-                    if abs(delta_x) > delta_x_max
-                        delta_x = delta_x_max
+                if newton_step_mode == :formula
+                    delta_x = dot(h_flat, evec) / lowest_eval
+
+                    if trust_region_eps === nothing
+                        # matches the reference literally: clamps the MAGNITUDE to
+                        # delta_x_max without preserving delta_x's sign. Harmless in
+                        # practice -- the sign-alignment above guarantees
+                        # dot(F,evec)<=0 and lowest_eval<0 here, so delta_x is
+                        # always >=0 already, and the clamp is a no-op on sign.
+                        if abs(delta_x) > delta_x_max
+                            delta_x = delta_x_max
+                        else
+                            n_fire += 1
+                        end
                     else
-                        n_fire += 1
+                        # Trust-region-adaptive cap (see this file's header for
+                        # what this is and how it was validated). Only ever
+                        # tighter than delta_x_max, never looser, so this is a
+                        # pure restriction of the original behavior, not a
+                        # wholesale change to it.
+                        cap = min(2.0 * trust_region_eps * h_norm / abs(lowest_eval), delta_x_max)
+                        if abs(delta_x) > cap
+                            delta_x = delta_x > 0 ? cap : -cap
+                        else
+                            n_fire += 1
+                        end
                     end
-                else
-                    # Trust-region-adaptive cap (see this file's header for
-                    # what this is and how it was validated). Only ever
-                    # tighter than delta_x_max, never looser, so this is a
-                    # pure restriction of the original behavior, not a
-                    # wholesale change to it.
-                    cap = min(2.0 * trust_region_eps * h_norm / abs(lowest_eval), delta_x_max)
-                    if abs(delta_x) > cap
-                        delta_x = delta_x > 0 ? cap : -cap
-                    else
-                        n_fire += 1
+                else   # :fixed_overshoot -- see this function's docstring
+                    if isnan(newton_fixed_step)
+                        newton_fixed_step = newton_fixed_step_fraction * delta_lm
+                    elseif prev_newton_evec !== nothing &&
+                           rad2deg(angle_between(prev_newton_evec, evec)) >= overshoot_angle_deg
+                        newton_fixed_step *= overshoot_shrink_factor
                     end
+                    prev_newton_evec = copy(evec)
+                    n_fire += 1
+                    delta_x = newton_fixed_step
                 end
+
                 push!(step_norms, abs(delta_x))
                 positions = positions .+ delta_x .* evec_matrix
             else

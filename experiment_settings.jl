@@ -77,6 +77,24 @@ LANCZOS_ITERATIONS = 10
 # top once DELTA_LM is validated at scale.
 TRUST_REGION_EPS = nothing
 
+# An alternative to both DELTA_X_MAX and TRUST_REGION_EPS above for the
+# Newton branch's step size, for comparing a simple heuristic against the
+# curvature-based formula on more equal footing: NEWTON_STEP_MODE=:formula
+# (default) is unchanged -- delta_x = dot(force,evec)/lowest_eval, clamped
+# by DELTA_X_MAX or the trust-region cap. :fixed_overshoot instead starts
+# at a CONSTANT step (NEWTON_FIXED_STEP_FRACTION * DELTA_LM -- "10% of
+# phase 1's step", at the default) and never recomputes it from
+# force/curvature; it only ever shrinks, by OVERSHOOT_SHRINK_FACTOR, when
+# the tracked eigenvector reverses by at least OVERSHOOT_ANGLE_DEG from one
+# iteration to the next (our proxy for "stepped past the stationary point
+# along it"). TRUST_REGION_EPS/DELTA_X_MAX are ignored under
+# :fixed_overshoot. See art_core_fortran.jl's run_art_attempt_fortran
+# docstring for the full mechanics.
+NEWTON_STEP_MODE = :formula
+NEWTON_FIXED_STEP_FRACTION = 0.1
+OVERSHOOT_ANGLE_DEG = 150.0
+OVERSHOOT_SHRINK_FACTOR = 0.5
+
 # :single (default) is the plain Fortran-reference kick -- one random atom,
 # random direction, magnitude KICK_MAGNITUDE. :shear is a new, opt-in
 # alternative (phase 1 of a planned generalization, see

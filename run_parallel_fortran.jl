@@ -110,6 +110,10 @@ end
 @everywhere trust_region_eps = $TRUST_REGION_EPS
 @everywhere kick_mode = $(QuoteNode(KICK_MODE))
 @everywhere freeze_push_direction = $FREEZE_PUSH_DIRECTION
+@everywhere newton_step_mode = $(QuoteNode(NEWTON_STEP_MODE))
+@everywhere newton_fixed_step_fraction = $NEWTON_FIXED_STEP_FRACTION
+@everywhere overshoot_angle_deg = $OVERSHOOT_ANGLE_DEG
+@everywhere overshoot_shrink_factor = $OVERSHOOT_SHRINK_FACTOR
 @everywhere begin
     data = parse_lammps_data(lammps_path)
     positions0 = hcat(data["x"], data["y"], data["z"])
@@ -143,6 +147,10 @@ end
             trust_region_eps = trust_region_eps,
             kick_mode = kick_mode,
             freeze_push_direction = freeze_push_direction,
+            newton_step_mode = newton_step_mode,
+            newton_fixed_step_fraction = newton_fixed_step_fraction,
+            overshoot_angle_deg = overshoot_angle_deg,
+            overshoot_shrink_factor = overshoot_shrink_factor,
         )
     end
 end
@@ -364,6 +372,10 @@ function print_minimal_summary(successes, positions0)
     println("kick_magnitude = $KICK_MAGNITUDE")
     println("kick_mode = $KICK_MODE")
     println("freeze_push_direction = $FREEZE_PUSH_DIRECTION")
+    println("newton_step_mode = $NEWTON_STEP_MODE")
+    println("newton_fixed_step_fraction = $NEWTON_FIXED_STEP_FRACTION")
+    println("overshoot_angle_deg = $OVERSHOOT_ANGLE_DEG")
+    println("overshoot_shrink_factor = $OVERSHOOT_SHRINK_FACTOR")
     println("starting_fire_iterations = $STARTING_FIRE_ITERATIONS")
     println("lanczos_iterations = $LANCZOS_ITERATIONS")
     println("max_iterations = $MAX_ITERATIONS")
