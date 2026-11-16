@@ -59,6 +59,8 @@ threshold. See find_decisive_push's docstring for the numbers this was
 calibrated against and the exact escalation logic.
 """
 import csv
+import json
+import os
 import numpy as np
 from scipy.spatial import cKDTree
 from scipy.optimize import linear_sum_assignment
@@ -100,6 +102,28 @@ PUSH_MAGNITUDES = [0.01, 0.02, 0.05, 0.1, 0.2, 0.35, 0.5]   # tried smallest-fir
 # scale; MAX_DISP_PLUS_MINUS is printed for every saddle so you can
 # sanity check/adjust it against your own data.
 MAX_ATOM_DISP_SAME_THRESHOLD = 0.05
+
+# ---------------------------------------------------------------------
+# Saddle repertoire
+# ---------------------------------------------------------------------
+# Same starting system, many seeds -> ART frequently rediscovers the same
+# handful of transitions (see cluster_by_max_disp's docstring below, which
+# already confirms this post-hoc by comparing saddle positions directly).
+# When a candidate's own saddle positions structurally match one already
+# validated, reuse that verdict instead of redoing the expensive push+
+# relax. Persisted under REPERTOIRE_DIR and saved incrementally (after
+# every newly-added entry, not just at the end), so a long validation run
+# that gets interrupted partway doesn't lose what it already learned.
+USE_REPERTOIRE = True
+REPERTOIRE_DIR = "saddle_repertoire"
+# Same metric AND same default value as MAX_ATOM_DISP_SAME_THRESHOLD above
+# (max single-atom displacement, not whole-system RMSD -- see that
+# constant's comment for why) -- this is the same comparison
+# cluster_by_max_disp already makes to decide "are these two saddle
+# points themselves the same", just applied incrementally instead of
+# post-hoc. Kept as its own constant so you can make repertoire-matching
+# stricter/looser than the push/relax decisiveness check independently.
+REPERTOIRE_MAX_DISP_THRESHOLD = MAX_ATOM_DISP_SAME_THRESHOLD
 
 # ---------------------------------------------------------------------
 # Mechanism classification (free volume hop / pair swap / chain / ...)
@@ -372,6 +396,84 @@ def cluster_by_max_disp(configs, box, threshold):
     return labels, len(reps)
 
 
+# =====================================================================
+# Saddle repertoire: persisted cache of already-validated saddles, keyed
+# by structural match (see USE_REPERTOIRE's comment above). index.json
+# holds everything except the position arrays (one list of dicts, one
+# per known distinct saddle); positions.npz holds the arrays themselves,
+# keyed "<id>_positions_saddle" / "<id>_pos_plus" / "<id>_pos_minus" (the
+# latter two absent for an entry whose push never relaxed cleanly).
+# =====================================================================
+def _repertoire_paths(repertoire_dir):
+    return os.path.join(repertoire_dir, "index.json"), os.path.join(repertoire_dir, "positions.npz")
+
+
+def load_repertoire(repertoire_dir, expected_natoms, expected_initial_energy):
+    """Returns (entries, usable). `entries` is [] if nothing is saved yet.
+    `usable` is False if a repertoire EXISTS but was built against a
+    different system (natoms or initial_energy mismatch) -- reusing it
+    would silently validate against the wrong starting structure, so this
+    refuses it (entries=[]) rather than guessing; the caller should then
+    also skip saving, to avoid clobbering what may be a perfectly good
+    repertoire for that OTHER system."""
+    index_path, npz_path = _repertoire_paths(repertoire_dir)
+    if not os.path.exists(index_path):
+        return [], True
+
+    with open(index_path) as f:
+        header = json.load(f)
+
+    if header["natoms"] != expected_natoms or \
+       abs(header["initial_energy"] - expected_initial_energy) > 1e-6:
+        print(f"*** WARNING: {repertoire_dir} exists but was built for a different system")
+        print(f"*** (natoms {header['natoms']} vs {expected_natoms} here, "
+              f"initial_energy {header['initial_energy']} vs {expected_initial_energy} here)")
+        print(f"*** -- NOT reusing or overwriting it this run. Point REPERTOIRE_DIR elsewhere")
+        print(f"*** (or clear it) if this system change was intentional.\n")
+        return [], False
+
+    entries = header["entries"]
+    arrays = np.load(npz_path) if entries else {}
+    for e in entries:
+        i = e["id"]
+        e["positions_saddle"] = arrays[f"{i}_positions_saddle"]
+        if not e["failed"]:
+            e["pos_plus"] = arrays[f"{i}_pos_plus"]
+            e["pos_minus"] = arrays[f"{i}_pos_minus"]
+    return entries, True
+
+
+def save_repertoire(repertoire_dir, entries, natoms, initial_energy):
+    os.makedirs(repertoire_dir, exist_ok=True)
+    index_path, npz_path = _repertoire_paths(repertoire_dir)
+
+    arrays = {}
+    header_entries = []
+    array_keys = ("positions_saddle", "pos_plus", "pos_minus")
+    for e in entries:
+        i = e["id"]
+        for key in array_keys:
+            if key in e:
+                arrays[f"{i}_{key}"] = e[key]
+        header_entries.append({k: v for k, v in e.items() if k not in array_keys})
+
+    np.savez(npz_path, **arrays)
+    with open(index_path, "w") as f:
+        json.dump({"natoms": natoms, "initial_energy": initial_energy, "entries": header_entries}, f, indent=2)
+
+
+def match_repertoire(positions_saddle, entries, box, threshold):
+    """First repertoire entry within `threshold` max_atom_displacement of
+    `positions_saddle`, or None. Greedy/first-match -- the same rule
+    cluster_by_max_disp above already uses to decide "are these the same
+    saddle", just checked incrementally against a running set instead of
+    all at once after the fact."""
+    for e in entries:
+        if max_atom_displacement(positions_saddle, e["positions_saddle"], box) < threshold:
+            return e
+    return None
+
+
 def find_decisive_push(positions_saddle, move, max_atom_disp, magnitudes, max_disp_threshold, data, box):
     """
     Push BOTH sides by the SAME magnitude each round, starting from the
@@ -590,7 +692,18 @@ def main():
     print(f"push magnitudes tried (per side) = {PUSH_MAGNITUDES}, "
           f"same-configuration max-atom-displacement threshold = {MAX_ATOM_DISP_SAME_THRESHOLD}\n")
 
+    repertoire, repertoire_usable = [], False
+    if USE_REPERTOIRE:
+        repertoire, repertoire_usable = load_repertoire(REPERTOIRE_DIR, data0["natoms"], initial_energy)
+        if repertoire:
+            print(f"saddle repertoire: {len(repertoire)} known distinct saddle(s) loaded from "
+                  f"{REPERTOIRE_DIR}\n")
+        elif repertoire_usable:
+            print(f"saddle repertoire: none saved yet -- starting fresh at {REPERTOIRE_DIR}\n")
+
     n_pass = n_fail = n_error = 0
+    n_cache_hits = 0
+    n_new_entries = 0
     saddle_seeds = []
     saddle_positions = []
     mechanisms = []
@@ -621,6 +734,45 @@ def main():
             continue
         line += f"  (raw max per-atom |move| in dump = {max_atom_disp:.6g})"
 
+        if USE_REPERTOIRE and repertoire_usable:
+            match = match_repertoire(positions_saddle, repertoire, box, REPERTOIRE_MAX_DISP_THRESHOLD)
+            if match is not None:
+                match["seeds_matched"].append(r["seed"])
+                n_cache_hits += 1
+
+                if match["failed"]:
+                    print(f"{line}\n  MATCHED repertoire saddle #{match['id']} (first seed="
+                          f"{match['first_seed']}, {len(match['seeds_matched'])}x so far) -- it never "
+                          f"relaxed cleanly either; skipped\n")
+                    n_error += 1
+                    continue
+
+                is_different = match["decisive"]
+                n_pass += is_different
+                n_fail += not is_different
+                barrier = r["final_energy"] - initial_energy
+
+                mechanism_line = ""
+                if is_different:
+                    mechanisms.append(dict(seed=r["seed"], dump_file=r["dump_file"],
+                                            barrier=barrier, **match["mechanism"]))
+                    m = match["mechanism"]
+                    mechanism_line = (f"  mechanism={m['category']}  n_active={m['n_active']}  "
+                                       f"n_eff={m['n_eff']:.2f}  Rg={m['radius_of_gyration']:.3f}\n")
+
+                print(f"{line}\n"
+                      f"  MATCHED repertoire saddle #{match['id']} (first seed={match['first_seed']}, "
+                      f"{len(match['seeds_matched'])}x so far) -- skipped relaxation\n"
+                      f"  push_used=+-{match['mag']:.3g}  E_plus={match['e_plus']:.6f}  "
+                      f"E_minus={match['e_minus']:.6f}  (saddle E={r['final_energy']:.6f}, barrier={barrier:.6f})\n"
+                      f"  max_atom_disp(plus,minus)={match['max_disp_plus_minus']:.5f}  "
+                      f"[whole-system RMSD(plus,minus)={match['rmsd_plus_minus']:.5f}]\n"
+                      f"  RMSD(plus,start)={match['rmsd_plus_start']:.5f}  "
+                      f"RMSD(minus,start)={match['rmsd_minus_start']:.5f}\n"
+                      f"  {'PASS -- two distinct minima' if is_different else 'SUSPICIOUS -- both sides relaxed to (nearly) the same configuration'} (cached)\n"
+                      f"{mechanism_line}")
+                continue
+
         try:
             result = find_decisive_push(
                 positions_saddle, move, max_atom_disp, PUSH_MAGNITUDES, MAX_ATOM_DISP_SAME_THRESHOLD, data0, box)
@@ -628,6 +780,13 @@ def main():
             if result is None:
                 print(f"{line}\n  FAILED: never relaxed cleanly on both sides at any of {PUSH_MAGNITUDES}\n")
                 n_error += 1
+                if USE_REPERTOIRE and repertoire_usable:
+                    repertoire.append(dict(id=len(repertoire), first_seed=r["seed"],
+                                            first_dump_file=r["dump_file"], seeds_matched=[r["seed"]],
+                                            final_energy=r["final_energy"], failed=True,
+                                            positions_saddle=positions_saddle))
+                    n_new_entries += 1
+                    save_repertoire(REPERTOIRE_DIR, repertoire, data0["natoms"], initial_energy)
                 continue
 
             mag = result["mag"]
@@ -665,12 +824,42 @@ def main():
                   f"RMSD(minus,start)={rmsd_minus_start:.5f}\n"
                   f"  {verdict}\n"
                   f"{mechanism_line}")
+
+            if USE_REPERTOIRE and repertoire_usable:
+                repertoire.append(dict(
+                    id=len(repertoire), first_seed=r["seed"], first_dump_file=r["dump_file"],
+                    seeds_matched=[r["seed"]], final_energy=r["final_energy"], failed=False,
+                    positions_saddle=positions_saddle, pos_plus=pos_plus, pos_minus=pos_minus,
+                    mag=mag, e_plus=e_plus, e_minus=e_minus,
+                    rmsd_plus_minus=rmsd_plus_minus, max_disp_plus_minus=max_disp_plus_minus,
+                    rmsd_plus_start=rmsd_plus_start, rmsd_minus_start=rmsd_minus_start,
+                    # result["decisive"] is numpy.bool_ (from a numpy-float
+                    # comparison) -- unlike numpy.float64, that does NOT
+                    # subclass Python's bool, so json.dump rejects it
+                    # unless cast explicitly.
+                    decisive=bool(is_different), mechanism=(mechanism if is_different else None),
+                ))
+                n_new_entries += 1
+                save_repertoire(REPERTOIRE_DIR, repertoire, data0["natoms"], initial_energy)
         except Exception as e:
             print(f"{line}\n  ERROR: {e}\n")
             n_error += 1
 
+    if USE_REPERTOIRE and repertoire_usable and repertoire:
+        # Covers cache hits too: those update seeds_matched in memory on
+        # every match, but only a newly-added entry triggers a save
+        # inside the loop above (saving on every cache hit as well would
+        # mean rewriting the whole .npz per row, undoing a good chunk of
+        # the time this feature is meant to save on a run that's mostly
+        # hits) -- one save here catches up anything the loop didn't.
+        save_repertoire(REPERTOIRE_DIR, repertoire, data0["natoms"], initial_energy)
+
     print(f"=== Summary: {n_pass} confirmed / {n_fail} suspicious / {n_error} skipped, "
           f"out of {len(successes)} successes ===")
+    if USE_REPERTOIRE:
+        print(f"saddle repertoire: {len(repertoire)} distinct saddle(s) known in total "
+              f"({n_new_entries} new this run), {n_cache_hits} of this run's successes were "
+              f"served from cache (skipped relaxation) -- saved to {REPERTOIRE_DIR}")
     if n_fail > 0:
         print("Suspicious ones already escalated through all of PUSH_MAGNITUDES without ever")
         print("seeing decisive divergence (see 'exhausted all push magnitudes' vs. 'stopped")
