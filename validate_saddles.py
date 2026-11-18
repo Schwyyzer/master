@@ -71,6 +71,26 @@ from scipy.optimize import linear_sum_assignment
 RESULTS_CSV = "results.csv"
 LAMMPS_PATH = "FILL_ME_IN"          # the exact LAMMPS_PATH that run used
 
+# `success=True` in results.csv only means an attempt wasn't discarded by
+# the degenerate-mode/second-eigenvalue guard -- it does NOT mean the
+# search actually force-converged (see compare_runs.py's module docstring
+# for the full reasoning and a real example: seed 7 had success=True,
+# converged=False, force_magnitude=5.05, a plain timeout that still
+# counted as "success"). Pushing from a position that was never actually
+# force-converged pushes from a point that isn't a stationary point at
+# all -- there's no physical reason to expect either side to relax back
+# to anything in particular, let alone the starting minimum specifically,
+# since a timeout can leave the system far from where it started (large
+# residual force driving real displacement over many iterations, not
+# "stuck in place"). True (default) excludes success=True-but-not-
+# converged rows from validation entirely, matching compare_runs.py's own
+# "genuine success" filter; set False to validate them anyway (they're
+# still reported, just not trusted as representative of your starting
+# structure's landscape). Has no effect on a CSV whose "converged" column
+# is absent (older driver) -- that's printed once, loudly, since it means
+# this filter silently can't do anything.
+REQUIRE_CONVERGED = True
+
 RC = 6.0                             # defaults mirror config.jl as it
 EPSILON_TABLE = np.array([           # currently stands in this repo --
     [0.0, 0.0, 0.0],                 # NOT guaranteed to match your run;
@@ -353,17 +373,24 @@ def parse_results_csv(path):
     rows = []
     with open(path, newline="") as f:
         reader = csv.DictReader(f)
+        has_converged = "converged" in (reader.fieldnames or [])
         for row in reader:
             if not row.get("seed"):
                 continue
+            conv = row.get("converged")
             rows.append({
                 "seed": int(row["seed"]),
                 "success": row["success"].strip().lower() == "true",
+                # None (not False!) when the column is absent -- lets
+                # main() tell "genuinely not converged" apart from "this
+                # CSV predates the converged column and we can't tell",
+                # which need different handling under REQUIRE_CONVERGED.
+                "converged": (conv.strip().lower() == "true") if has_converged else None,
                 "dump_file": row["dump_file"],
                 "final_energy": float(row["final_energy"]),
                 "initial_energy": float(row["initial_energy"]),
             })
-    return rows
+    return rows, has_converged
 
 
 def com_removed_rmsd(a, b, box):
@@ -703,7 +730,7 @@ def main():
     pairs0 = build_neighbor_pairs(positions0, RC, box)
     initial_energy = compute_energy(positions0, data0["cid"], box, pairs0)
 
-    rows = parse_results_csv(RESULTS_CSV)
+    rows, has_converged_col = parse_results_csv(RESULTS_CSV)
     if not rows:
         raise SystemExit(f"no rows parsed from {RESULTS_CSV}")
 
@@ -728,6 +755,21 @@ def main():
         print("are at least consistent with the starting point of this run.\n")
 
     successes = [r for r in rows if r["success"]]
+    if REQUIRE_CONVERGED:
+        if not has_converged_col:
+            print("*** WARNING: REQUIRE_CONVERGED=True but this CSV has no 'converged' column "
+                  "(older driver?) --")
+            print("*** cannot tell genuinely-converged successes from timeouts, so nothing is being")
+            print("*** excluded. Set REQUIRE_CONVERGED=False to silence this, or confirm this CSV's")
+            print("*** driver never writes timeouts as success=True before trusting the count below.\n")
+        else:
+            n_before = len(successes)
+            successes = [r for r in successes if r["converged"]]
+            n_excluded = n_before - len(successes)
+            if n_excluded > 0:
+                print(f"excluded {n_excluded} success=True row(s) that did NOT actually converge "
+                      f"(timed out at max_iterations) -- REQUIRE_CONVERGED=True; see that setting's "
+                      f"comment for why these aren't validated.\n")
     print(f"{len(successes)} successful saddle(s) to validate out of {len(rows)} attempts in the CSV")
     print(f"push magnitudes tried (per side) = {PUSH_MAGNITUDES}, "
           f"same-configuration max-atom-displacement threshold = {MAX_ATOM_DISP_SAME_THRESHOLD}\n")

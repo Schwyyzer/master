@@ -68,6 +68,19 @@ LAMMPS_PATH = "FILL_ME_IN"   # the EXACT LAMMPS_PATH that produced this CSV
                               # this; same risk, same reason it's not
                               # defaulted to a guess.
 
+# Same setting/reasoning as validate_saddles.py's REQUIRE_CONVERGED (see
+# that file for the full explanation): success=True does not mean the
+# search force-converged, only that it wasn't discarded by a guard. The
+# Hessian's eigenvalues are well-defined at any configuration, converged
+# or not -- but "how many are negative" only answers "what TYPE of
+# critical point is this" when it IS one; at a position that timed out
+# (gradient still well above force_tolerance) it isn't a critical point
+# at all, so the count describes local curvature at an arbitrary location,
+# not a saddle classification. True (default) excludes success=True-but-
+# not-converged rows; has no effect if the CSV's "converged" column is
+# absent, which is printed loudly rather than silently skipped.
+REQUIRE_CONVERGED = True
+
 # Mass used in the Hessian -- [dummy, type1, type2], matching
 # EPSILON_TABLE/SIGMA_TABLE's 1-indexed convention (index 0 unused).
 # [0.0, 1.0, 1.0] (unit mass) matches run_parallel_fortran.jl's active
@@ -214,6 +227,7 @@ def parse_results_csv(path):
     rows = []
     with open(path, newline="") as f:
         reader = csv.DictReader(f)
+        has_converged = "converged" in (reader.fieldnames or [])
         for row in reader:
             if not row.get("seed"):
                 continue
@@ -236,7 +250,7 @@ def parse_results_csv(path):
                 "is_saddle": optbool("is_saddle"),
                 "converged": optbool("converged"),
             })
-    return rows
+    return rows, has_converged
 
 
 def csv_agreement_note(is_saddle, n_negative):
@@ -268,7 +282,7 @@ def main():
     pairs0 = build_neighbor_pairs(positions0, RC, box)
     initial_energy = compute_energy(positions0, data0["cid"], box, pairs0)
 
-    rows = parse_results_csv(RESULTS_CSV)
+    rows, has_converged_col = parse_results_csv(RESULTS_CSV)
     if not rows:
         raise SystemExit(f"no rows parsed from {RESULTS_CSV}")
 
@@ -283,6 +297,21 @@ def main():
         print("are at least consistent with the starting point of this run.\n")
 
     successes = [r for r in rows if r["success"]]
+    if REQUIRE_CONVERGED:
+        if not has_converged_col:
+            print("*** WARNING: REQUIRE_CONVERGED=True but this CSV has no 'converged' column -- "
+                  "cannot exclude timeouts, so nothing is being excluded. Set REQUIRE_CONVERGED=False")
+            print("*** to silence this, or confirm this CSV's driver never writes timeouts as "
+                  "success=True before trusting the counts below.\n")
+        else:
+            n_before = len(successes)
+            successes = [r for r in successes if r["converged"]]
+            n_excluded = n_before - len(successes)
+            if n_excluded > 0:
+                print(f"excluded {n_excluded} success=True row(s) that did NOT actually converge "
+                      f"(timed out) -- REQUIRE_CONVERGED=True; a non-stationary point isn't a saddle "
+                      f"of any order, see that setting's comment.\n")
+
     method_desc = (f"partial (k={N_EIGENVALUES}, SA, auto-escalates to full if inconclusive)"
                    if PARTIAL_EIGENSOLVE else "full dense")
     print(f"{len(successes)} successful saddle(s) to check out of {len(rows)} attempts in the CSV")
