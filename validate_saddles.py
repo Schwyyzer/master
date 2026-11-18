@@ -126,6 +126,26 @@ REPERTOIRE_DIR = "saddle_repertoire"
 REPERTOIRE_MAX_DISP_THRESHOLD = MAX_ATOM_DISP_SAME_THRESHOLD
 
 # ---------------------------------------------------------------------
+# Adjacency to the starting minimum
+# ---------------------------------------------------------------------
+# Is one of a saddle's two relaxed endpoints (pos_plus/pos_minus) the
+# STARTING minimum itself, not just some other nearby configuration?
+# find_decisive_push already does the only expensive part (the push +
+# relax); this is a free comparison against positions0 using the data it
+# already produced -- no extra relaxation, let alone re-running the
+# original ART search. A saddle where NEITHER side matches the start
+# still connects two real configurations, just not ones reachable in a
+# single step from where your search actually began (e.g. a kick late in
+# a longer trajectory that had already wandered elsewhere first) -- worth
+# knowing before treating its barrier as "the barrier from my starting
+# structure". Same metric/default as MAX_ATOM_DISP_SAME_THRESHOLD, for
+# the same reason (max single-atom displacement, not whole-system RMSD,
+# which dilutes a localized difference on a large system) -- its own
+# constant so you can set it independently.
+ADJACENCY_MAX_DISP_THRESHOLD = MAX_ATOM_DISP_SAME_THRESHOLD
+ADJACENCY_CSV = "adjacency_check.csv"
+
+# ---------------------------------------------------------------------
 # Mechanism classification (free volume hop / pair swap / chain / ...)
 # ---------------------------------------------------------------------
 # Classifies each CONFIRMED saddle's transition mechanism from the same
@@ -394,6 +414,26 @@ def cluster_by_max_disp(configs, box, threshold):
             assigned = len(reps) - 1
         labels.append(assigned)
     return labels, len(reps)
+
+
+def adjacency_verdict(max_disp_plus_start, max_disp_minus_start, threshold):
+    """Is one of a saddle's two relaxed endpoints the STARTING minimum
+    itself (by the same max_atom_displacement metric/threshold everywhere
+    else in this file judges "same configuration")? Returns
+    (adjacent: bool, side: "plus"/"minus"/"neither", note: str). If
+    neither side matches, this saddle connects two OTHER configurations --
+    still possibly a genuine saddle, just not one directly reachable from
+    your starting minimum in a single step."""
+    if max_disp_plus_start < threshold:
+        return True, "plus", (f"PLUS side IS the starting minimum (max_atom_disp={max_disp_plus_start:.5f}) "
+                               f"-- MINUS is the new state this saddle connects it to")
+    if max_disp_minus_start < threshold:
+        return True, "minus", (f"MINUS side IS the starting minimum (max_atom_disp={max_disp_minus_start:.5f}) "
+                                f"-- PLUS is the new state this saddle connects it to")
+    return False, "neither", (f"NEITHER side matches the starting minimum "
+                               f"(max_atom_disp(plus,start)={max_disp_plus_start:.5f}, "
+                               f"max_atom_disp(minus,start)={max_disp_minus_start:.5f}, threshold={threshold}) "
+                               f"-- this saddle connects two OTHER configurations, not directly from your start")
 
 
 # =====================================================================
@@ -707,6 +747,8 @@ def main():
     saddle_seeds = []
     saddle_positions = []
     mechanisms = []
+    adjacency_rows = []
+    n_adjacent = 0
 
     for r in successes:
         line = f"seed={r['seed']}  dump={r['dump_file']}"
@@ -760,6 +802,16 @@ def main():
                     mechanism_line = (f"  mechanism={m['category']}  n_active={m['n_active']}  "
                                        f"n_eff={m['n_eff']:.2f}  Rg={m['radius_of_gyration']:.3f}\n")
 
+                max_disp_plus_start = max_atom_displacement(match["pos_plus"], positions0, box)
+                max_disp_minus_start = max_atom_displacement(match["pos_minus"], positions0, box)
+                adjacent, side, adj_note = adjacency_verdict(
+                    max_disp_plus_start, max_disp_minus_start, ADJACENCY_MAX_DISP_THRESHOLD)
+                n_adjacent += adjacent
+                adjacency_rows.append(dict(seed=r["seed"], dump_file=r["dump_file"], decisive=is_different,
+                                            max_disp_plus_start=max_disp_plus_start,
+                                            max_disp_minus_start=max_disp_minus_start,
+                                            adjacent_to_start=adjacent, adjacent_side=side))
+
                 print(f"{line}\n"
                       f"  MATCHED repertoire saddle #{match['id']} (first seed={match['first_seed']}, "
                       f"{len(match['seeds_matched'])}x so far) -- skipped relaxation\n"
@@ -770,7 +822,8 @@ def main():
                       f"  RMSD(plus,start)={match['rmsd_plus_start']:.5f}  "
                       f"RMSD(minus,start)={match['rmsd_minus_start']:.5f}\n"
                       f"  {'PASS -- two distinct minima' if is_different else 'SUSPICIOUS -- both sides relaxed to (nearly) the same configuration'} (cached)\n"
-                      f"{mechanism_line}")
+                      f"{mechanism_line}"
+                      f"  {adj_note}\n")
                 continue
 
         try:
@@ -814,6 +867,16 @@ def main():
                 mechanism_line = (f"  mechanism={mechanism['category']}  n_active={mechanism['n_active']}  "
                                    f"n_eff={mechanism['n_eff']:.2f}  Rg={mechanism['radius_of_gyration']:.3f}\n")
 
+            max_disp_plus_start = max_atom_displacement(pos_plus, positions0, box)
+            max_disp_minus_start = max_atom_displacement(pos_minus, positions0, box)
+            adjacent, side, adj_note = adjacency_verdict(
+                max_disp_plus_start, max_disp_minus_start, ADJACENCY_MAX_DISP_THRESHOLD)
+            n_adjacent += adjacent
+            adjacency_rows.append(dict(seed=r["seed"], dump_file=r["dump_file"], decisive=is_different,
+                                        max_disp_plus_start=max_disp_plus_start,
+                                        max_disp_minus_start=max_disp_minus_start,
+                                        adjacent_to_start=adjacent, adjacent_side=side))
+
             print(f"{line}\n"
                   f"  push_used=+-{mag:.3g}{'  (largest tried)' if mag == PUSH_MAGNITUDES[-1] else ''}  "
                   f"E_plus={e_plus:.6f}  E_minus={e_minus:.6f}  "
@@ -823,7 +886,8 @@ def main():
                   f"  RMSD(plus,start)={rmsd_plus_start:.5f}  "
                   f"RMSD(minus,start)={rmsd_minus_start:.5f}\n"
                   f"  {verdict}\n"
-                  f"{mechanism_line}")
+                  f"{mechanism_line}"
+                  f"  {adj_note}\n")
 
             if USE_REPERTOIRE and repertoire_usable:
                 repertoire.append(dict(
@@ -870,6 +934,23 @@ def main():
         print(f"{n_error} skipped/failed -- if these are all 'never relaxed cleanly at any of")
         print("PUSH_MAGNITUDES', re-check the initial_energy match printed above first: a")
         print("config/LAMMPS_PATH mismatch would produce exactly this kind of uniform failure.")
+
+    if adjacency_rows:
+        with open(ADJACENCY_CSV, "w", newline="") as f:
+            fieldnames = ["seed", "dump_file", "decisive", "max_disp_plus_start",
+                          "max_disp_minus_start", "adjacent_to_start", "adjacent_side"]
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(adjacency_rows)
+        print(f"\n{n_adjacent}/{len(adjacency_rows)} pushed saddles are confirmed adjacent to the "
+              f"starting minimum (one relaxed endpoint IS positions0, within "
+              f"max_atom_disp<{ADJACENCY_MAX_DISP_THRESHOLD}) -- see {ADJACENCY_CSV} for the per-saddle "
+              f"breakdown (adjacent_side: which of plus/minus is the start, or 'neither').")
+        if n_adjacent < len(adjacency_rows):
+            print(f"{len(adjacency_rows) - n_adjacent} saddle(s) have NEITHER side matching the start -- "
+                  f"those connect two other configurations, not one reachable in a single step from "
+                  f"your starting minimum. Worth knowing before citing their barrier as a barrier FROM "
+                  f"your starting structure specifically.")
 
     # =================================================================
     # Are the SADDLE POINTS THEMSELVES distinct from each other, or is
