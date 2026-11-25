@@ -852,7 +852,8 @@ def main():
                 adjacency_rows.append(dict(seed=r["seed"], dump_file=r["dump_file"], decisive=is_different,
                                             max_disp_plus_start=max_disp_plus_start,
                                             max_disp_minus_start=max_disp_minus_start,
-                                            adjacent_to_start=adjacent, adjacent_side=side))
+                                            adjacent_to_start=adjacent, adjacent_side=side,
+                                            repertoire_id=match["id"]))
 
                 print(f"{line}\n"
                       f"  MATCHED repertoire saddle #{match['id']} (first seed={match['first_seed']}, "
@@ -914,10 +915,19 @@ def main():
             adjacent, side, adj_note = adjacency_verdict(
                 max_disp_plus_start, max_disp_minus_start, ADJACENCY_MAX_DISP_THRESHOLD)
             n_adjacent += adjacent
+            # id this row's saddle will get in the repertoire, so it can be
+            # deduplicated against other rows later -- id=len(repertoire) is
+            # exactly what the repertoire.append(...) below will assign it,
+            # read here first since that append hasn't happened yet. None
+            # when there's no repertoire to assign an id at all (nothing to
+            # dedupe against in that case -- counted as its own distinct
+            # saddle below).
+            new_entry_id = len(repertoire) if (USE_REPERTOIRE and repertoire_usable) else None
             adjacency_rows.append(dict(seed=r["seed"], dump_file=r["dump_file"], decisive=is_different,
                                         max_disp_plus_start=max_disp_plus_start,
                                         max_disp_minus_start=max_disp_minus_start,
-                                        adjacent_to_start=adjacent, adjacent_side=side))
+                                        adjacent_to_start=adjacent, adjacent_side=side,
+                                        repertoire_id=new_entry_id))
 
             print(f"{line}\n"
                   f"  push_used=+-{mag:.3g}{'  (largest tried)' if mag == PUSH_MAGNITUDES[-1] else ''}  "
@@ -980,7 +990,7 @@ def main():
     if adjacency_rows:
         with open(ADJACENCY_CSV, "w", newline="") as f:
             fieldnames = ["seed", "dump_file", "decisive", "max_disp_plus_start",
-                          "max_disp_minus_start", "adjacent_to_start", "adjacent_side"]
+                          "max_disp_minus_start", "adjacent_to_start", "adjacent_side", "repertoire_id"]
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             writer.writerows(adjacency_rows)
@@ -994,24 +1004,21 @@ def main():
                   f"your starting minimum. Worth knowing before citing their barrier as a barrier FROM "
                   f"your starting structure specifically.")
 
-        if USE_REPERTOIRE and repertoire:
-            # n_adjacent above counts every SEED/attempt that was adjacent,
-            # so a saddle hit by 20 cache-matched seeds counts 20 times.
-            # This instead counts each repertoire entry (= one structurally
-            # distinct saddle) exactly once, regardless of how many seeds
-            # matched it -- the "distinct adjacent saddles" figure, not the
-            # "adjacent attempts" figure.
-            usable_entries = [e for e in repertoire if not e["failed"]]
-            distinct_adjacent = sum(
-                1 for e in usable_entries
-                if adjacency_verdict(
-                    max_atom_displacement(e["pos_plus"], positions0, box),
-                    max_atom_displacement(e["pos_minus"], positions0, box),
-                    ADJACENCY_MAX_DISP_THRESHOLD)[0]
-            )
-            print(f"Of those, {distinct_adjacent}/{len(usable_entries)} are DISTINCT adjacent "
-                  f"saddles -- i.e. counting each repertoire entry once rather than once per "
-                  f"seed that matched it.")
+        # n_adjacent counts every SEED/attempt THIS RUN that was adjacent, so
+        # a saddle this run cache-hit 20 times counts 20 times. Dedupe down
+        # to how many DISTINCT repertoire entries those n_adjacent attempts
+        # actually correspond to -- deliberately scoped to just this run's
+        # rows (via each row's repertoire_id), not the whole, possibly much
+        # older and larger repertoire: entries from past runs that this
+        # run's 768 successes never touched aren't part of "the 231".
+        adjacent_ids = [row["repertoire_id"] for row in adjacency_rows if row["adjacent_to_start"]]
+        n_distinct_adjacent = (
+            len({i for i in adjacent_ids if i is not None}) +
+            sum(1 for i in adjacent_ids if i is None)   # no repertoire id to dedupe by -- count as-is
+        )
+        print(f"Of those {n_adjacent} adjacent attempts, {n_distinct_adjacent} are DISTINCT saddles "
+              f"-- i.e. counting each repertoire entry this run matched or created only once, no "
+              f"matter how many of this run's seeds (cache hits included) landed on it.")
 
     # =================================================================
     # Are the SADDLE POINTS THEMSELVES distinct from each other, or is
