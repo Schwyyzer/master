@@ -994,6 +994,25 @@ def main():
                   f"your starting minimum. Worth knowing before citing their barrier as a barrier FROM "
                   f"your starting structure specifically.")
 
+        if USE_REPERTOIRE and repertoire:
+            # n_adjacent above counts every SEED/attempt that was adjacent,
+            # so a saddle hit by 20 cache-matched seeds counts 20 times.
+            # This instead counts each repertoire entry (= one structurally
+            # distinct saddle) exactly once, regardless of how many seeds
+            # matched it -- the "distinct adjacent saddles" figure, not the
+            # "adjacent attempts" figure.
+            usable_entries = [e for e in repertoire if not e["failed"]]
+            distinct_adjacent = sum(
+                1 for e in usable_entries
+                if adjacency_verdict(
+                    max_atom_displacement(e["pos_plus"], positions0, box),
+                    max_atom_displacement(e["pos_minus"], positions0, box),
+                    ADJACENCY_MAX_DISP_THRESHOLD)[0]
+            )
+            print(f"Of those, {distinct_adjacent}/{len(usable_entries)} are DISTINCT adjacent "
+                  f"saddles -- i.e. counting each repertoire entry once rather than once per "
+                  f"seed that matched it.")
+
     # =================================================================
     # Are the SADDLE POINTS THEMSELVES distinct from each other, or is
     # this ART search mostly rediscovering the same handful of
